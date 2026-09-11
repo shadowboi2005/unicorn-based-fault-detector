@@ -5,8 +5,11 @@ import os
 import sys
 import time
 
+from . import assess as assessmod
 from . import faults as faultmod
 from . import firmware as fw
+from . import profiles as profilemod
+from . import report as reportmod
 from .elfimage import ElfImage
 from .leakage import MODELS as LEAK_MODELS
 from .leakage import LeakageTracer
@@ -270,6 +273,45 @@ def cmd_leak(args):
     return 0
 
 
+def _profile(args, scheme):
+    return profilemod.profile_for(scheme, override=getattr(args, "profile", None))
+
+
+def _emit(args, result):
+    print(reportmod.format_table(result))
+    if getattr(args, "plot", None):
+        os.makedirs(args.plot, exist_ok=True)
+        out = os.path.join(args.plot, f"{result.mode}.png")
+        written = reportmod.plot_sweep(result, out)
+        if written:
+            print(f"wrote {written}")
+    return 0
+
+
+def cmd_sweep(args):
+    """Whole-call fault sweep over the operation's inner loop (ALAFA-style)."""
+    m, scheme = _machine(args)
+    profile = _profile(args, scheme)
+    result = assessmod.sweep_sites(scheme, profile, n=args.n, detector=args.detector)
+    return _emit(args, result)
+
+
+def cmd_funcskip(args):
+    """Instruction-skip sweep inside one function, via capture-and-replay."""
+    m, scheme = _machine(args)
+    profile = _profile(args, scheme)
+    target = None
+    if args.target:
+        targets = profile.targets() if hasattr(profile, "targets") else {}
+        if args.target not in targets:
+            raise SystemExit(f"unknown --target {args.target!r}; "
+                             f"known: {', '.join(sorted(targets)) or 'none'}")
+        target = targets[args.target]
+    result = assessmod.sweep_function(scheme, profile, target=target, n=args.n,
+                                      detector=args.detector, backend=args.backend)
+    return _emit(args, result)
+
+
 # --- argument parsing -------------------------------------------------------
 
 
@@ -396,6 +438,29 @@ def build_parser():
     )
     p.add_argument("--out", help="write the trace to .npy or .csv")
     p.set_defaults(handler=cmd_leak)
+
+    p = sub.add_parser("sweep", help="whole-call fault sweep over the signing loop "
+                       "(ALAFA-style two-key leak test)")
+    add_elf(p)
+    p.add_argument("--n", type=int, default=24, help="signatures per key")
+    p.add_argument("--detector", default="two_key",
+                   choices=("two_key", "uniformity", "spec_aware"))
+    p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
+    p.add_argument("--plot", help="directory to write the result bar chart into")
+    p.set_defaults(handler=cmd_sweep)
+
+    p = sub.add_parser("funcskip", help="instruction-skip sweep inside one function "
+                       "(capture-and-replay)")
+    add_elf(p)
+    p.add_argument("--target", help="named funcskip target (default: the profile's)")
+    p.add_argument("--n", type=int, default=24, help="signatures per key")
+    p.add_argument("--detector", default=None,
+                   choices=("two_key", "uniformity", "spec_aware"),
+                   help="override the profile's detector for the target")
+    p.add_argument("--backend", default="call", choices=("call", "snapshot"))
+    p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
+    p.add_argument("--plot", help="directory to write the result bar chart into")
+    p.set_defaults(handler=cmd_funcskip)
 
     return parser
 

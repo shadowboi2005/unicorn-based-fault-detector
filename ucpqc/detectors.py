@@ -18,7 +18,7 @@ right detector depends on the faulted quantity's *role*:
 import numpy as np
 
 __all__ = [
-    "matched", "loo_scores", "two_key_accuracy", "tvla_t", "perm_pvalue",
+    "matched_filter", "loo_scores", "two_key_accuracy", "tvla_t", "perm_pvalue",
     "mmd_test", "uniformity_divergence", "band_count", "band_levene",
 ]
 
@@ -26,7 +26,7 @@ __all__ = [
 # --------------------------------------------------------------------------
 # feature extraction
 # --------------------------------------------------------------------------
-def matched(c, z):
+def matched_filter(c, z):
     """c-aware feature: negacyclic correlation of the sparse challenge ``c``
     against each response polynomial.
 

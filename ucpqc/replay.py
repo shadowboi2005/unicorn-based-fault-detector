@@ -90,8 +90,9 @@ class Recorder:
     """Install capture hooks on a target; the caller drives the signings.
 
         rec = Recorder(m, target)
+        mark = m.scratch_mark()
         for msg in messages:
-            m._alloc_ptr = hwm
+            m.scratch_reset(mark)        # free the previous signing's buffers
             rec.arm()
             scheme.sign(msg, sk)
             cap = rec.take(key)          # the nth invocation's Capture, or None
@@ -100,8 +101,8 @@ class Recorder:
     """
 
     def __init__(self, machine, target, snapshot=True, snapshot_regions=None):
-        self.m = machine
-        self.t = target
+        self.machine = machine
+        self.target = target
         self._want_snap = snapshot
         self._regions = snapshot_regions
         self._count = 0
@@ -125,30 +126,30 @@ class Recorder:
 
     # -- function target ----------------------------------------------------
     def _is_target(self, count):
-        return self.t.nth == -1 or count == self.t.nth
+        return self.target.nth == -1 or count == self.target.nth
 
     def _grab_entry(self, mm, ret):
         cap = Capture(key=None, entry=self.entry, ret=ret)
         cap.regs = {r: mm.reg(r) for r in ("r0", "r1", "r2", "r3", "sp", "lr")}
-        for i, spec in enumerate(self.t.args):
+        for i, spec in enumerate(self.target.args):
             regval = cap.regs[f"r{i}"]
             if spec == "scalar":
                 cap.scalars[i] = regval
             elif spec[0] == "in":
                 cap.inputs[i] = mm.read(regval, spec[1])
             # ("out", n): nothing to read at entry
-        if self.t.out != "ret":
-            cap.out_ptr = cap.regs[f"r{self.t.out}"]
+        if self.target.out != "ret":
+            cap.out_ptr = cap.regs[f"r{self.target.out}"]
         if self._want_snap:
             cap.snap = (mm.snapshot(self._regions) if self._regions
                         else mm.snapshot())
         return cap
 
     def _finish_output(self, mm, cap):
-        if self.t.out == "ret":
+        if self.target.out == "ret":
             cap.golden_output = mm.reg("r0")
         else:
-            cap.golden_output = mm.read(cap.out_ptr, self.t.out_size())
+            cap.golden_output = mm.read(cap.out_ptr, self.target.out_size())
 
     def _on_arm(self, mm):
         self._count += 1
@@ -194,7 +195,7 @@ class Recorder:
             self._trig.detach()
         if self._region_hooks is not None:
             for h in self._region_hooks:
-                self.m.unhook(h)
+                self.machine.unhook(h)
 
 
 # --------------------------------------------------------------------------
@@ -236,7 +237,7 @@ def _replay_snapshot(machine, target, cap, spec, budget):
 def _replay_call(machine, target, cap, spec, budget):
     if target.func is None:
         raise ValueError("call backend needs a function target, not a region")
-    hwm = machine._alloc_ptr          # reclaim scratch after this trial
+    mark = machine.scratch_mark()     # reclaim scratch after this trial
     try:
         # relocate every buffer to fresh scratch (Machine.call's stack would
         # clobber the captured stack addresses otherwise), PRESERVING aliasing:
@@ -275,7 +276,7 @@ def _replay_call(machine, target, cap, spec, budget):
                 inj.detach()
         return _read_out(machine, target, out_addr, ret_val)   # copies bytes out
     finally:
-        machine._alloc_ptr = hwm
+        machine.scratch_reset(mark)
 
 
 # --------------------------------------------------------------------------
@@ -306,7 +307,7 @@ def skip_sweep(machine, target, captures_by_key, featurize, detect,
     populations.
 
     `captures_by_key` is {key: [Capture, ...]}.
-    `featurize(capture, output) -> feature`   (e.g. matched(cap.c, unpack(out)))
+    `featurize(capture, output) -> feature`   (e.g. matched_filter(cap.c, unpack(out)))
     `detect(features_by_key) -> dict`         (e.g. {'acc': two_key_accuracy(...)})
     Returns per-site dicts: {'pc', 'text', 'crashed', 'ran', **detect_result}.
     """

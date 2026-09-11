@@ -309,6 +309,24 @@ class Machine:
         self.uc.mem_write(addr, bytes(data))
         return addr
 
+    def scratch_mark(self):
+        """Return the current scratch high-water mark, to be handed back to
+        :meth:`scratch_reset`.  Use it to reclaim per-iteration scratch buffers
+        in a loop so repeated `alloc`s do not exhaust the scratch region::
+
+            mark = m.scratch_mark()
+            for msg in messages:
+                m.scratch_reset(mark)      # free last iteration's buffers
+                ...
+        """
+        return self._alloc_ptr
+
+    def scratch_reset(self, mark):
+        """Rewind the scratch allocator to a mark from :meth:`scratch_mark`,
+        freeing everything allocated since (the memory is not cleared, just made
+        available again)."""
+        self._alloc_ptr = mark
+
     # -- symbols ------------------------------------------------------------
 
     def addr_of(self, name_or_addr):
