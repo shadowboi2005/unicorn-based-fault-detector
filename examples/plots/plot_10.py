@@ -22,7 +22,7 @@ import numpy as np
 from ucpqc import Machine, Scheme
 from ucpqc.faults import SKIP, FaultSpec, Injector
 from ucpqc.replay import Recorder, Target, benchmark_backends, replay, skip_sweep
-from ucpqc.detectors import matched, two_key_accuracy
+from ucpqc.detectors import matched_filter, two_key_accuracy
 
 ELF = sys.argv[1] if len(sys.argv) > 1 else "firmware/ml-dsa-44_m4f_test.elf"
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 24
@@ -84,7 +84,7 @@ capsB = collect(kB, b"nonce-B", "B")
 
 
 def featurize(cap, out):
-    return matched(cap.c, unpack_vec(out))
+    return matched_filter(cap.c, unpack_vec(out))
 
 
 def detect(feats):

@@ -87,7 +87,7 @@ def unpack_s1(sk):                    # only for the internal validation line
     return np.array(S, float)
 
 
-def matched(c, z):
+def matched_filter(c, z):
     """Negacyclic correlation of the sparse challenge c against each z poly --
     a c-aware statistic (the marginal of z is secret-independent by design, so a
     plain histogram sees nothing; this is what exposes the joint (c, z) law)."""
@@ -115,7 +115,7 @@ def collect(sk, nonce_seed):
     for msg in messages:
         m._alloc_ptr = hwm
         sig = scheme.sign(msg, sk)
-        feats.append(matched(challenge(sig[:CT]), unpack_z(sig)))
+        feats.append(matched_filter(challenge(sig[:CT]), unpack_z(sig)))
     return np.array(feats)
 
 

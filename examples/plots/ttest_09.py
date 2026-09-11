@@ -79,7 +79,7 @@ def unpack_z(sig):
     return np.array(z, float).reshape(L, NC)
 
 
-def matched(c, z):
+def matched_filter(c, z):
     supp = np.nonzero(c)[0]; cs = c[supp]
     mf = np.zeros((L, NC))
     for l in range(L):
@@ -114,7 +114,7 @@ def collect(sk, seed):
             raise Unstable("sign failed")
         if len(sig) != SIGLEN:
             raise Unstable("malformed signature")
-        feats.append(matched(challenge(sig[:CT]), unpack_z(sig)))
+        feats.append(matched_filter(challenge(sig[:CT]), unpack_z(sig)))
     return np.array(feats)
 
 

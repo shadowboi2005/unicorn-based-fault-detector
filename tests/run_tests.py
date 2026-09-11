@@ -350,6 +350,54 @@ def test_manifest_is_read_back():
     assert scheme.manifest["sizes"]["pk"] == 1312
 
 
+# --- framework: scratch API, profiles, assess -------------------------------
+
+
+def test_scratch_mark_reset():
+    m, _ = booted()
+    mark = m.scratch_mark()
+    a = m.alloc(64)
+    b = m.alloc(128)
+    assert b != a
+    m.scratch_reset(mark)
+    assert m.alloc(64) == a, "scratch_reset rewinds the allocator to the mark"
+
+
+def test_profile_auto_selection():
+    from ucpqc.profiles import profile_for
+    from ucpqc.profiles.mldsa import MLDSAProfile, SIGLEN
+    _, scheme = booted()
+    prof = profile_for(scheme)
+    assert isinstance(prof, MLDSAProfile), "ml-dsa ELF selects the ML-DSA profile"
+    assert SIGLEN == 2420
+    assert len(prof.fault_sites(None)) == 20
+    assert prof.detector_for(prof.default_target()) == "two_key"
+
+
+def test_profile_feature_roundtrip():
+    from ucpqc.profiles import profile_for
+    m, scheme = booted()
+    prof = profile_for(scheme)
+    prof.setup(m)
+    pk, sk = scheme.keypair()
+    sig = scheme.sign(b"hi", sk)
+    feat = prof.feature(prof.challenge(m, sig), prof.response_from_signature(sig))
+    assert feat.shape == (1024,), "matched-filter feature is L*NC = 1024"
+
+
+def test_funcskip_flags_the_mask_add():
+    from ucpqc import assess
+    from ucpqc.profiles import profile_for
+    _, scheme = booted()
+    prof = profile_for(scheme)
+    result = assess.sweep_function(scheme, prof, n=8)
+    leaks = result.leaks()
+    assert leaks, "polyvecl_add has at least one leaking skip site"
+    poly_add = scheme.machine.addr_of("pqcrystals_dilithium_poly_add")
+    assert any(f"{poly_add:#x}"[2:] in r.label for r in leaks), \
+        "skipping the bl to poly_add leaks (z stays c*s1)"
+
+
 # --- runner -----------------------------------------------------------------
 
 

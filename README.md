@@ -52,9 +52,19 @@ python -m ucpqc calls     fw.elf --op keypair --depth 4
 python -m ucpqc trace     fw.elf --func ntt --scope body --csv ntt.csv
 python -m ucpqc leak      fw.elf --func ntt --model hd_reg --out ntt.npy
 python -m ucpqc fault     fw.elf --func challenge --model skip --hit 2 --csv faults.csv
+python -m ucpqc sweep     fw.elf --n 24                    # whole-call leak sweep (ALAFA)
+python -m ucpqc funcskip  fw.elf --target polyvecl_add     # intra-function skip sweep
 python -m ucpqc build     crypto_kem/ml-kem-768/m4fspeed
 python -m ucpqc schemes   dilithium         # what is available in the pqm4 tree
 ```
+
+`sweep` and `funcskip` are the two **leakage-assessment modes**.  `sweep` skips
+each whole operation call in the signing loop and runs a two-key leak test on the
+released signatures (only `z = z + y` leaks, at 100%).  `funcskip` skips every
+instruction *inside* one function by capturing its I/O once and replaying just
+that function per trial (~240x cheaper than re-signing).  Both auto-select an
+**analysis profile** from the scheme (`--profile` to override, `--detector` to
+force `two_key`/`uniformity`/`spec_aware`, `--plot DIR` to render a bar chart).
 
 `--func` accepts a symbol name or one of the landmarks the framework resolves
 per scheme family (`ntt`, `invntt`, `challenge`, `decompose`, `keccak`).
@@ -94,6 +104,9 @@ transformed = struct.unpack("<256i", m.read(poly, 1024))
 | `MemoryTracer` | every load/store in an address range | medium |
 | `LeakageTracer` | one leakage sample per instruction or access | high |
 | `FaultCampaign` | sweep of fault models, classified against a golden run | one run per trial |
+| `assess.sweep_sites` | whole-call leak sweep of the operation loop (mode `sweep`) | one op per trial |
+| `assess.sweep_function` | intra-function instruction-skip sweep via capture-replay (mode `funcskip`) | one function per trial |
+| `detectors` | two-key classifier, TVLA t-test, MMD, uniformity, band tests | — |
 
 Faults are a `FaultSpec` (what) plus a trigger (when): `at=` a global
 instruction index, or `pc=` a symbol/address on its `hit`-th execution. Models
@@ -151,6 +164,33 @@ What you *may* want to add, and where:
 | Convenient names for internals (`--func ntt`) | add an entry to `LANDMARKS` in `ucpqc/scheme.py` |
 | A different board (STM32, nRF, …) | add a `Platform` in `ucpqc/platform.py` (memory map + UART base) and model any peripheral the firmware pokes in `Peripherals` |
 | A different core (Cortex-M0/M33, RISC-V) | `Machine(..., cpu=...)` for another Cortex-M; another architecture needs the Unicorn arch/mode and the semihosting decoder in `machine.py` |
+| Leakage `sweep`/`funcskip` on a new scheme | add an **analysis profile** (below) |
+
+### Adding a scheme to the leakage modes
+
+`Scheme.bind` makes any pqm4 scheme *run*.  The `sweep`/`funcskip` modes need one
+more thing — an **`AnalysisProfile`** (`ucpqc/profiles/`) that supplies the
+scheme-specific analysis knowledge the emulator can't infer: which fault sites to
+sweep, how to turn a released artifact or a captured buffer into a detector
+feature, and which detector fits a target.  The engine (`ucpqc/assess.py`) is
+written entirely against this interface, so a new scheme is a new module here and
+no engine change.  `ucpqc/profiles/mldsa.py` is the worked example:
+
+```python
+from ucpqc.profiles import AnalysisProfile, register
+
+class FalconProfile(AnalysisProfile):
+    patterns = ("falcon-*",)
+    def fault_sites(self, image): ...          # [(addr, label), ...]
+    def challenge(self, machine, artifact): ...  # per-artifact context
+    def response_from_signature(self, art): ...  # sweep-mode response
+    def response_from_output(self, buf): ...     # funcskip-mode response
+    def feature(self, context, response): ...    # -> feature vector
+
+register(FalconProfile)
+```
+
+The profile is auto-selected from `scheme.name`; KEM profiles set `op = "decaps"`.
 
 Implementations of the same algorithm should agree bit for bit under the same
 seeded RNG, which is a good check after adding one:
@@ -234,6 +274,11 @@ ucpqc/
   tracing.py    profiler, call tracer, instruction and memory traces
   faults.py     fault models, injector, campaign runner
   leakage.py    leakage models, trace sets, CPA correlation
+  replay.py     capture a function's I/O, replay it in isolation under faults
+  detectors.py  two-key classifier, TVLA, MMD, uniformity, band tests
+  assess.py     the sweep/funcskip mode engine (scheme-agnostic)
+  report.py     console table + bar-chart reporting for assessments
+  profiles/     per-scheme analysis knowledge (AnalysisProfile; mldsa.py)
   firmware.py   pqm4 builds and manifest generation
   cli.py        python -m ucpqc
 ```
