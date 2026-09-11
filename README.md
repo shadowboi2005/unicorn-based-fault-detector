@@ -293,6 +293,17 @@ if you extend it:
    *discovered* by disassembly instead of hard-coded — a good hardening step to
    make the profile work on any `ml-dsa-44` ELF, not just this one.)
 
+**MAYO** (multivariate, a NIST additional-signatures candidate) is a second,
+non-lattice worked example.  It *runs* on the general core with nothing added —
+`python -m ucpqc build crypto_sign/mayo1/m4f` then `roundtrip`/`profile`/`fault`/
+`leak` all work.  Its `profiles/mayo.py` shows the honest edge of the abstraction:
+MAYO has no sparse challenge or masked response, so the matched filter does not
+apply.  The profile therefore discovers its sweep sites by **disassembly**
+(`discover_call_sites`, portable across builds) and uses a **generic raw-byte
+feature** — a scaffold, since MAYO's randomised signature can confound a two-key
+test (the engine's golden-baseline guard flags that).  A high-SNR MAYO leak
+feature needs MAYO-specific cryptanalysis and is left as future work.
+
 The `AnalysisProfile` interface *is* the boundary: everything a new scheme must
 supply is exactly this scheme-specific surface, and everything else is reused.
 
@@ -322,7 +333,7 @@ ucpqc/
   detectors.py  two-key classifier, TVLA, MMD, uniformity, band tests
   assess.py     the sweep/funcskip mode engine (scheme-agnostic)
   report.py     console table + bar-chart reporting for assessments
-  profiles/     per-scheme analysis knowledge (AnalysisProfile; mldsa.py)
+  profiles/     per-scheme analysis knowledge (AnalysisProfile; mldsa.py, mayo.py)
   firmware.py   pqm4 builds and manifest generation
   cli.py        python -m ucpqc
 ```

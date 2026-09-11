@@ -72,6 +72,9 @@ KNOWN_SIZES = {
     # A few other pqm4 signature schemes
     "falcon-512": dict(kind=SIGN, pk=897, sk=1281, sig=752),
     "falcon-1024": dict(kind=SIGN, pk=1793, sk=2305, sig=1462),
+    # MAYO (multivariate; NIST additional-signatures) -- mayo1 verified from a
+    # pqm4 build, the rest fall back to the build manifest.
+    "mayo1": dict(kind=SIGN, pk=1420, sk=24, sig=454),
     "sphincs-sha2-128f": dict(kind=SIGN, pk=32, sk=64, sig=17088),
     "sphincs-sha2-128s": dict(kind=SIGN, pk=32, sk=64, sig=7856),
 }

@@ -398,6 +398,21 @@ def test_funcskip_flags_the_mask_add():
         "skipping the bl to poly_add leaks (z stays c*s1)"
 
 
+def test_mayo_runs_and_selects_profile():
+    from ucpqc.profiles import profile_for
+    from ucpqc.profiles.mayo import MayoProfile
+    m = Machine.from_elf(need(os.path.join(FIRMWARE, "mayo1_m4f_test.elf")))
+    scheme = Scheme.bind(m)
+    m.boot()
+    m.stub_randombytes(b"tests")
+    assert scheme.name.startswith("mayo"), "a multivariate scheme, detected generically"
+    prof = profile_for(scheme)
+    assert isinstance(prof, MayoProfile)
+    assert len(prof.fault_sites(m)) > 5, "sweep sites discovered by disassembly"
+    pk, sk = scheme.keypair()                # runs end to end via the general core
+    assert scheme.verify(scheme.sign(b"hi", sk), b"hi", pk)
+
+
 # --- runner -----------------------------------------------------------------
 
 

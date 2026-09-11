@@ -26,7 +26,8 @@ The profile is selected automatically from `scheme.name` via `profile_for`.
 
 import fnmatch
 
-__all__ = ["AnalysisProfile", "register", "profile_for", "profiles"]
+__all__ = ["AnalysisProfile", "register", "profile_for", "profiles",
+           "discover_call_sites"]
 
 
 class AnalysisProfile:
@@ -53,9 +54,10 @@ class AnalysisProfile:
         per-iteration `scratch_reset`).  Default: nothing."""
 
     # -- sweep-site enumeration ---------------------------------------------
-    def fault_sites(self, image):
+    def fault_sites(self, machine):
         """Return `[(addr, label), ...]` -- the whole-call sweep sites in the
-        operation's inner loop (may be hard-coded per firmware or discovered)."""
+        operation's inner loop (hard-coded per firmware, or discovered from the
+        machine's disassembly via :func:`discover_call_sites`)."""
         raise NotImplementedError
 
     # -- feature extraction (shared by both modes) --------------------------
@@ -85,6 +87,27 @@ class AnalysisProfile:
         "uniformity" (a nonce that must be uniform), or "spec_aware" (a
         rejection-bound quantity).  Default: two_key."""
         return "two_key"
+
+
+# --- helpers ---------------------------------------------------------------
+def discover_call_sites(machine, func):
+    """Every `bl`/`blx` inside `func`'s body as `[(addr, label)]`, labelling the
+    callee by symbol -- a firmware-agnostic alternative to a hard-coded site
+    table (`fault_sites` can just return this)."""
+    start, end = machine.image.extent_of(func)
+    sites, pc = [], start
+    while pc < end:
+        addr, size, text = machine.disasm_one(pc)
+        if text.startswith("bl ") or text.startswith("blx "):
+            label = text
+            if "#" in text:
+                try:
+                    label = f"bl {machine.image.describe(int(text.split('#')[-1], 16))}"
+                except ValueError:
+                    pass
+            sites.append((addr, label))
+        pc += size or 2
+    return sites
 
 
 # --- registry --------------------------------------------------------------
@@ -118,4 +141,4 @@ def profile_for(scheme, override=None):
 
 
 # import built-in profiles so they self-register on `import ucpqc.profiles`
-from . import mldsa  # noqa: E402,F401
+from . import mayo, mldsa  # noqa: E402,F401

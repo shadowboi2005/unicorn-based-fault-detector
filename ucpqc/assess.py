@@ -120,7 +120,7 @@ def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
     sk = {k: _keypair(scheme, seed)[1] for k, seed in zip("AB", keys)}
     profile.setup(m)
     messages = standard_messages(n)
-    sites = [(None, "no fault (control)")] + list(profile.fault_sites(m.image))
+    sites = [(None, "no fault (control)")] + list(profile.fault_sites(m))
 
     def collect(site):
         feats = {"A": [], "B": []}

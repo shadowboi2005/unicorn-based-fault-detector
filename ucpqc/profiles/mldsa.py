@@ -66,8 +66,8 @@ class MLDSAProfile(AnalysisProfile):
             self._cbuf = machine.alloc(4 * N_COEFFS)
 
     # -- sweep sites --------------------------------------------------------
-    def fault_sites(self, image):
-        return list(SIGNING_SITES)
+    def fault_sites(self, machine):
+        return list(SIGNING_SITES)          # hard-coded for this firmware build
 
     # -- feature extraction -------------------------------------------------
     def challenge(self, machine, artifact):
