@@ -1,0 +1,239 @@
+# ucpqc — a Unicorn framework for running PQC firmware
+
+Runs **CRYSTALS-Dilithium (ML-DSA)** — and any other pqm4 scheme — on an
+emulated ARM Cortex-M4, and exposes the execution to Python: call individual
+functions with your own inputs, trace them, inject faults, and record
+simulated leakage traces.
+
+The emulated board is **MPS2-AN386**, the same target the pqm4 `make` flow and
+the QEMU setup in `../QEMU-test` use, so the ELFs are byte-identical to what
+`qemu-system-arm -M mps2-an386` executes. Unlike QEMU-plus-GDB, the whole
+machine is a Python object: you can call `crypto_sign_signature_ctx` directly,
+snapshot the state, flip a bit in a register at instruction 4,712,003, and read
+the resulting signature back — without a debugger in the loop.
+
+```
+$ python -m ucpqc roundtrip firmware/ml-dsa-44_m4f_test.elf
+scheme:   ml-dsa-44/m4f (sign)
+  pk     1312 bytes  ae8960e8d4ec99ab190ec60f1ad82b02...
+  sk     2560 bytes  ae8960e8d4ec99ab190ec60f1ad82b02...
+  sig    2420 bytes  2640ceec5fc84107eb3c788a25cba8b3...
+
+instruction counts:
+  keypair         1,292,688
+  signature      12,132,505
+  verify          1,261,019
+
+verified: True   (1.40s wall)
+```
+
+## Setup
+
+```bash
+make setup          # .venv with unicorn, capstone, pyelftools, numpy
+make firmware       # builds ML-DSA-44/65, ML-KEM-768 and the ML-DSA reference
+make test           # 24 tests, ~20s
+make demo
+```
+
+`make firmware` drives the pqm4 tree at `../pqm4` (override with `PQM4=`). It
+stages each ELF into `firmware/` together with a JSON manifest recording the
+scheme's buffer sizes, read out of its headers with the C preprocessor.
+
+## Command line
+
+```bash
+python -m ucpqc run       fw.elf            # boot it, print its UART output
+python -m ucpqc info      fw.elf            # API binding, sizes, memory map
+python -m ucpqc symbols   fw.elf 'poly_*'
+python -m ucpqc roundtrip fw.elf            # keygen/sign/verify (or KEM) by direct calls
+python -m ucpqc profile   fw.elf --op sign --top 15
+python -m ucpqc calls     fw.elf --op keypair --depth 4
+python -m ucpqc trace     fw.elf --func ntt --scope body --csv ntt.csv
+python -m ucpqc leak      fw.elf --func ntt --model hd_reg --out ntt.npy
+python -m ucpqc fault     fw.elf --func challenge --model skip --hit 2 --csv faults.csv
+python -m ucpqc build     crypto_kem/ml-kem-768/m4fspeed
+python -m ucpqc schemes   dilithium         # what is available in the pqm4 tree
+```
+
+`--func` accepts a symbol name or one of the landmarks the framework resolves
+per scheme family (`ntt`, `invntt`, `challenge`, `decompose`, `keccak`).
+
+## Python API
+
+```python
+from ucpqc import Machine, Scheme
+
+m = Machine.from_elf("firmware/ml-dsa-44_m4f_test.elf")
+scheme = Scheme.bind(m)          # entry points and sizes come from the ELF
+m.boot()                         # reset -> SystemInit -> main, C runtime ready
+m.stub_randombytes(b"seed")      # RNG becomes a reproducible SHAKE256 stream
+
+pk, sk = scheme.keypair()
+sig = scheme.sign(b"hello", sk)
+assert scheme.verify(sig, b"hello", pk)
+print(scheme.last_cost)          # {'keypair': 1292688, 'signature': 12132505, ...}
+```
+
+Any function in the image can be called directly with AAPCS arguments:
+
+```python
+import struct
+poly = m.alloc_bytes(struct.pack("<256i", *coefficients))
+m.call("pqcrystals_dilithium_ntt", [poly])
+transformed = struct.unpack("<256i", m.read(poly, 1024))
+```
+
+### Analysis layers
+
+| Tool | What it gives you | Cost |
+|---|---|---|
+| `Profiler` | instructions per function over a whole operation | negligible |
+| `CallTracer` | call tree with per-call instruction cost | low |
+| `InstructionTracer` | every instruction, optionally with registers | high |
+| `MemoryTracer` | every load/store in an address range | medium |
+| `LeakageTracer` | one leakage sample per instruction or access | high |
+| `FaultCampaign` | sweep of fault models, classified against a golden run | one run per trial |
+
+Faults are a `FaultSpec` (what) plus a trigger (when): `at=` a global
+instruction index, or `pc=` a symbol/address on its `hit`-th execution. Models
+are instruction skip, register bit-flip, register stuck-at, memory bit-flip,
+memory stuck-at, and condition-flag inversion.
+
+```python
+from ucpqc import FaultCampaign, FaultSpec
+from ucpqc.faults import sweep_function_body
+
+campaign = FaultCampaign(m, lambda mm: scheme.sign(msg, sk))
+campaign.prepare()                                    # golden run + snapshot
+campaign.run(sweep_function_body(m, "pqcrystals_dilithium_poly_chknorm"))
+print(campaign.format())        # silent / different / rejected / crash / timeout
+```
+
+Each trial restores a snapshot taken just before the golden run, so a trial
+costs one signing operation and nothing else.
+
+## Running another PQC scheme
+
+The emulator, the tracers, the fault injector and the leakage models work on
+instructions and memory; none of them names an algorithm. Only
+`ucpqc/scheme.py` knows what a signature or a KEM is, and it discovers that
+from the ELF. For a scheme that is in pqm4, the whole change is a build:
+
+```bash
+python -m ucpqc build crypto_kem/ml-kem-768/m4fspeed
+python -m ucpqc roundtrip firmware/ml-kem-768_m4fspeed_test.elf
+```
+
+That works because `Scheme.bind()` does three things automatically:
+
+1. **Entry points** — pattern-matches the symbol table for `crypto_sign_*` or
+   `crypto_kem_*`, including PQClean's namespaced spellings
+   (`PQCLEAN_MLKEM768_CLEAN_crypto_kem_enc`) and the pq-crystals reference
+   names (`pqcrystals_dilithium2_ref_keypair`). Signature schemes with the
+   FIPS 204 context API get the 7-argument `_ctx` form; older ones get the
+   5-argument form.
+2. **Buffer sizes** — from the manifest written at build time, falling back to
+   a table of well-known schemes, and finally to over-allocation with size
+   probing (`Scheme.probe_sizes()`).
+3. **Operations** — `keypair`/`sign`/`verify` for signatures,
+   `keypair`/`encaps`/`decaps` for KEMs, both reachable through
+   `scheme.roundtrip()`.
+
+What you *may* want to add, and where:
+
+| Situation | What to change |
+|---|---|
+| Another pqm4 scheme | nothing — `python -m ucpqc build <scheme path>` |
+| Keep it in `make firmware` | add the path to `SCHEMES` in the `Makefile` |
+| Firmware built outside pqm4 | point `Machine.from_elf()` at the ELF; if it has no manifest, pass `Scheme(m, sizes=Sizes(pk=..., sk=..., sig=...))` or call `probe_sizes()` |
+| Unusual API names | `Scheme(m, binding=Binding(kind, {"keypair": "...", ...}))` |
+| Convenient names for internals (`--func ntt`) | add an entry to `LANDMARKS` in `ucpqc/scheme.py` |
+| A different board (STM32, nRF, …) | add a `Platform` in `ucpqc/platform.py` (memory map + UART base) and model any peripheral the firmware pokes in `Peripherals` |
+| A different core (Cortex-M0/M33, RISC-V) | `Machine(..., cpu=...)` for another Cortex-M; another architecture needs the Unicorn arch/mode and the semihosting decoder in `machine.py` |
+
+Implementations of the same algorithm should agree bit for bit under the same
+seeded RNG, which is a good check after adding one:
+
+```
+$ python examples/05_other_schemes.py
+ml-dsa-44/clean          sign  ok=True   keypair=1,554,753  signature=3,419,958 ...
+ml-dsa-44/m4f            sign  ok=True   keypair=1,272,633  signature=2,084,160 ...
+ml-kem-768/m4fspeed      kem   ok=True   keypair=565,098  enc=579,495  dec=619,135
+
+cross-implementation check (same seed, same message):
+  ml-dsa-44: ml-dsa-44_clean_test.elf vs ml-dsa-44_m4f_test.elf  ->  identical
+```
+
+## Examples
+
+| File | What it shows |
+|---|---|
+| `examples/01_run_and_call.py` | booting the firmware vs. driving its API |
+| `examples/02_profile_and_calls.py` | where a signature spends its cycles |
+| `examples/03_fault_campaign.py` | skipping instructions in the norm check |
+| `examples/04_leakage_cpa.py` | a full CPA against the NTT, inside the emulator |
+| `examples/05_other_schemes.py` | the same code driving KEMs and other schemes |
+
+The CPA example recovers the leak of an NTT input coefficient with
+correlation 1.0 at `pqcrystals_dilithium_ntt+0x24` — the load that first
+touches it.
+
+## How it works
+
+**Boot.** The ELF's `PT_LOAD` segments are written at their physical
+addresses, `.bss` is zeroed, and the core starts at the reset vector with SP
+from the vector table. `boot()` runs as far as `main`, so by the time you call
+anything the C runtime, the FPU and the UART are up.
+
+**Peripherals.** Unicorn emulates only the CPU core, so the board is modelled
+in `platform.py`: the CMSDK UART (its output is captured), SysTick and the DWT
+cycle counter (both derived from the emulated instruction count), and SCB/NVIC
+registers as plain storage. ARM semihosting (`bkpt 0xAB`) is decoded for
+`SYS_WRITEC/WRITE0/WRITE/EXIT`, which is how pqm4 firmware signals that it is
+done.
+
+**Direct calls.** `call()` sets up AAPCS arguments, points `lr` at an
+unmapped-to-the-guest trampoline page, and stops when execution returns there.
+Arguments are allocated in a scratch region that the firmware's own heap can
+never collide with.
+
+**Counting.** Instructions are counted per basic block (cheap, exact at block
+boundaries). Anything needing an exact index — an instruction tracer, a fault
+triggered on `at=` — switches the machine to per-instruction counting, which
+costs roughly 10× in speed. Hooks scoped to an address range keep the fast
+path; that is what `--scope body` does.
+
+Rough speeds on this machine: 14 MIPS unhooked (a full ML-DSA-44 signature in
+~1s), ~1.5 MIPS with a global per-instruction hook.
+
+## Caveats
+
+- **Instructions, not cycles.** The counter is an instruction count. It is a
+  good proxy for the pqm4 cycle counts (keypair 1,286,649 reported by the
+  firmware's own benchmark vs 1,286,622 counted here) but it does not model
+  wait states, flash latency or pipeline effects.
+- **Leakage is idealised.** Noise-free, perfectly aligned, and a Hamming
+  weight/distance model of a register file — enough to answer *whether* and
+  *where* a value leaks, not how many real traces an attack needs. Add noise
+  with `LeakageTracer.save(..., noise=σ)`.
+- **No interrupts.** SysTick is modelled as a counter but its interrupt is
+  never delivered, so the firmware's own overflow bookkeeping would wrap;
+  `stub_cycle_counter()` replaces `hal_get_time` with the exact count instead.
+- **Block-level attribution.** `Profiler` and `CallTracer` attribute at basic
+  block granularity, so a block interrupted mid-way is charged in full.
+
+## Layout
+
+```
+ucpqc/
+  platform.py   board memory map and peripheral models
+  elfimage.py   ELF loading, symbol index, address -> function
+  machine.py    the emulated core: boot, run, call, snapshot, hooks
+  scheme.py     the only scheme-aware layer: API detection and sizes
+  tracing.py    profiler, call tracer, instruction and memory traces
+  faults.py     fault models, injector, campaign runner
+  leakage.py    leakage models, trace sets, CPA correlation
+  firmware.py   pqm4 builds and manifest generation
+  cli.py        python -m ucpqc
+```

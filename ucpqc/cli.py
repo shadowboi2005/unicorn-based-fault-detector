@@ -1,0 +1,413 @@
+"""Command line front end: `python -m ucpqc <command>`."""
+
+import argparse
+import os
+import sys
+import time
+
+from . import faults as faultmod
+from . import firmware as fw
+from .elfimage import ElfImage
+from .leakage import MODELS as LEAK_MODELS
+from .leakage import LeakageTracer
+from .machine import EmulationError, Machine
+from .platform import PLATFORMS
+from .scheme import SIGN, Scheme
+from .tracing import CallTracer, InstructionTracer, MemoryTracer, Profiler
+
+DEFAULT_PQM4 = os.environ.get("UCPQC_PQM4", "../pqm4")
+
+
+# --- helpers ----------------------------------------------------------------
+
+
+def _machine(args, stub_rng=True):
+    m = Machine.from_elf(args.elf, platform=PLATFORMS[getattr(args, "platform", "mps2-an386")])
+    scheme = Scheme.bind(m)
+    m.boot()
+    if stub_rng:
+        try:
+            m.stub_randombytes(getattr(args, "seed", "ucpqc").encode())
+        except KeyError:
+            print("warning: no randombytes symbol; using the firmware's own RNG",
+                  file=sys.stderr)
+    m.stub_cycle_counter()
+    return m, scheme
+
+
+def _operation(scheme, name, message=b"ucpqc", budget=200_000_000):
+    """Build a callable performing one named operation, for reuse by commands.
+
+    Returns (fn, description).  The keys/ciphertext it needs are generated
+    once, up front, so the measured operation is only the one asked for.
+    """
+    kwargs = {"max_instructions": budget}
+    if scheme.kind == SIGN:
+        if name == "keypair":
+            return (lambda m: scheme.keypair(**kwargs)), "keypair"
+        pk, sk = scheme.keypair()
+        if name == "sign":
+            return (lambda m: scheme.sign(message, sk, **kwargs)), "sign"
+        if name == "verify":
+            sig = scheme.sign(message, sk)
+            return (lambda m: scheme.verify(sig, message, pk, **kwargs)), "verify"
+        if name == "roundtrip":
+            return (lambda m: scheme.roundtrip(message, **kwargs)), "roundtrip"
+    else:
+        if name == "keypair":
+            return (lambda m: scheme.keypair(**kwargs)), "keypair"
+        pk, sk = scheme.keypair()
+        if name in ("enc", "sign"):
+            return (lambda m: scheme.encaps(pk, **kwargs)), "encaps"
+        if name in ("dec", "verify"):
+            ct, _ = scheme.encaps(pk)
+            return (lambda m: scheme.decaps(ct, sk, **kwargs)), "decaps"
+        if name == "roundtrip":
+            return (lambda m: scheme.roundtrip(message, **kwargs)), "roundtrip"
+    raise SystemExit(f"unknown operation {name!r} for a {scheme.kind} scheme")
+
+
+def _resolve_func(scheme, name):
+    """Allow landmark aliases (ntt, keccak, ...) wherever a symbol is expected."""
+    return scheme.landmark(name) or name
+
+
+# --- commands ---------------------------------------------------------------
+
+
+def cmd_build(args):
+    staged = fw.build(
+        args.scheme,
+        args.pqm4,
+        out_dir=args.out,
+        platform=args.platform,
+        tests=tuple(args.tests.split(",")),
+        jobs=args.jobs,
+    )
+    print(f"\n{len(staged)} firmware image(s) ready in {args.out}/")
+    return 0
+
+
+def cmd_schemes(args):
+    found = fw.discover(args.pqm4, args.pattern)
+    for path in found:
+        print(path)
+    print(f"\n{len(found)} implementation(s) in {args.pqm4}", file=sys.stderr)
+    return 0
+
+
+def cmd_info(args):
+    image = ElfImage(args.elf)
+    m, scheme = _machine(args)
+    print(f"firmware: {args.elf}")
+    print(f"entry:    {image.entry:#010x}   functions: {len(image.functions)}")
+    print(scheme.describe())
+    print("\nmemory map:")
+    for region in m.platform.ram_regions:
+        print(f"  {region.name:<11} {region.base:#010x} - {region.end:#010x}")
+    for region in (m.platform.apb, m.platform.ppb):
+        print(f"  {region.name:<11} {region.base:#010x} - {region.end:#010x}  (mmio)")
+    print(f"\nboot to main: {m.icount} instructions")
+    return 0
+
+
+def cmd_symbols(args):
+    image = ElfImage(args.elf)
+    for sym in image.find(args.pattern or "*", kind=None if args.all else "STT_FUNC"):
+        print(f"{sym.addr:#010x}  {sym.size:>7}  {sym.kind:<11} {sym.name}")
+    return 0
+
+
+def cmd_run(args):
+    m = Machine.from_elf(args.elf, platform=PLATFORMS[args.platform])
+    if args.stream:
+        m.peripherals.on_uart_byte = lambda b: (
+            sys.stdout.write(chr(b)),
+            sys.stdout.flush(),
+        )
+    started = time.time()
+    try:
+        m.run(max_instructions=args.max_insns)
+    except EmulationError as exc:
+        print(f"\n!! {exc}", file=sys.stderr)
+        return 1
+    finally:
+        elapsed = time.time() - started
+    if not args.stream:
+        print(m.uart_text())
+    print(
+        f"--- exit={m.exit_code:#x} instructions={m.icount:,} "
+        f"time={elapsed:.2f}s ({m.icount / max(elapsed, 1e-9) / 1e6:.1f} MIPS)",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def cmd_roundtrip(args):
+    m, scheme = _machine(args)
+    started = time.time()
+    result = scheme.roundtrip(args.message.encode())
+    print(f"scheme:   {scheme.name} ({scheme.kind})")
+    for key in ("pk", "sk", "sig", "ct", "ss"):
+        if key in result:
+            value = result[key]
+            print(f"  {key:<4} {len(value):>6} bytes  {value[:16].hex()}...")
+    print("\ninstruction counts:")
+    for op, count in result["cost"].items():
+        print(f"  {op:<10} {count:>14,}")
+    verdict = "verified" if scheme.kind == SIGN else "shared secrets match"
+    print(f"\n{verdict}: {result['ok']}   ({time.time() - started:.2f}s wall)")
+    return 0 if result["ok"] else 1
+
+
+def cmd_profile(args):
+    m, scheme = _machine(args)
+    op, label = _operation(scheme, args.op, args.message.encode())
+    prof = Profiler(m)
+    started = time.time()
+    op(m)
+    prof.detach()
+    print(f"profile of {label} ({scheme.name}), {time.time() - started:.2f}s wall\n")
+    print(prof.format(args.top))
+    return 0
+
+
+def cmd_calls(args):
+    m, scheme = _machine(args)
+    op, label = _operation(scheme, args.op, args.message.encode())
+    tracer = CallTracer(m, max_depth=args.depth)
+    op(m)
+    tracer.finish()
+    tracer.detach()
+    print(f"call tree of {label} ({len(tracer.calls)} calls):\n")
+    print(tracer.format(args.lines, min_cost=args.min_cost))
+    return 0
+
+
+def cmd_trace(args):
+    m, scheme = _machine(args)
+    func = _resolve_func(scheme, args.func) if args.func else None
+    op, label = _operation(scheme, args.op, args.message.encode())
+    if args.mem:
+        tracer = MemoryTracer(m, window=func, limit=args.limit)
+    else:
+        tracer = InstructionTracer(
+            m, window=func, limit=args.limit, with_regs=args.regs, scope=args.scope
+        )
+    op(m)
+    scope = f" inside {func}" if func else ""
+    print(f"{len(tracer)} records from {label}{scope}\n")
+    if args.csv:
+        print("written to", tracer.write_csv(args.csv))
+    else:
+        print(tracer.format(args.lines))
+    return 0
+
+
+def cmd_fault(args):
+    m, scheme = _machine(args)
+    func = _resolve_func(scheme, args.func)
+    message = args.message.encode()
+
+    if scheme.kind == SIGN:
+        pk, sk = scheme.keypair()
+
+        def operation(machine):
+            sig = scheme.sign(message, sk, max_instructions=args.budget)
+            if args.check and not scheme.verify(sig, message, pk):
+                raise ValueError("faulty signature does not verify")
+            return sig
+
+    else:
+        pk, sk = scheme.keypair()
+
+        def operation(machine):
+            ct, ss = scheme.encaps(pk, max_instructions=args.budget)
+            if args.check and scheme.decaps(ct, sk) != ss:
+                raise ValueError("shared secrets disagree")
+            return ct, ss
+
+    campaign = faultmod.FaultCampaign(m, operation, budget=args.budget)
+    print(f"golden run of {scheme.name}...", flush=True)
+    campaign.prepare()
+
+    if args.model == faultmod.BITFLIP_REG:
+        specs = list(
+            faultmod.sweep_register_bits(
+                m.addr_of(func),
+                regs=tuple(args.regs.split(",")),
+                bits=range(0, 32, args.stride),
+                hit=args.hit,
+            )
+        )
+    else:
+        specs = list(
+            faultmod.sweep_function_body(
+                m, func, kind=args.model, stride=args.stride, count=args.count, hit=args.hit
+            )
+        )
+    print(f"{len(specs)} trials against {func} (hit #{args.hit})\n", flush=True)
+    campaign.run(specs, progress=args.progress)
+    print("\n" + campaign.format())
+    if args.csv:
+        print("\nwritten to", campaign.write_csv(args.csv))
+    return 0
+
+
+def cmd_leak(args):
+    m, scheme = _machine(args)
+    func = _resolve_func(scheme, args.func) if args.func else None
+    op, label = _operation(scheme, args.op, args.message.encode())
+    tracer = LeakageTracer(
+        m, model=args.model, window=func, limit=args.limit, scope=args.scope
+    )
+    started = time.time()
+    op(m)
+    print(f"{label} traced in {time.time() - started:.2f}s")
+    print(tracer.summary())
+    if args.out:
+        print("written to", tracer.save(args.out, noise=args.noise))
+    return 0
+
+
+# --- argument parsing -------------------------------------------------------
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ucpqc",
+        description="Unicorn-based emulation of post-quantum crypto firmware "
+        "(CRYSTALS-Dilithium and friends) on Cortex-M4.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_elf(p, op_default=None):
+        p.add_argument("elf", help="firmware ELF to emulate")
+        p.add_argument("--platform", default="mps2-an386", choices=sorted(PLATFORMS))
+        p.add_argument("--seed", default="ucpqc", help="seed for the stubbed RNG")
+        p.add_argument("--message", default="ucpqc", help="message to sign")
+        if op_default:
+            p.add_argument(
+                "--op",
+                default=op_default,
+                help="operation to drive: keypair, sign/enc, verify/dec, roundtrip",
+            )
+
+    p = sub.add_parser("build", help="build a scheme from pqm4 and stage it")
+    p.add_argument("scheme", help="e.g. crypto_sign/ml-dsa-44/m4f")
+    p.add_argument("--pqm4", default=DEFAULT_PQM4)
+    p.add_argument("--out", default="firmware")
+    p.add_argument("--platform", default=fw.DEFAULT_PLATFORM)
+    p.add_argument("--tests", default="test", help="comma separated: test,speed,stack,...")
+    p.add_argument("--jobs", type=int, default=None)
+    p.set_defaults(handler=cmd_build)
+
+    p = sub.add_parser("schemes", help="list schemes available in a pqm4 tree")
+    p.add_argument("pattern", nargs="?", default="")
+    p.add_argument("--pqm4", default=DEFAULT_PQM4)
+    p.set_defaults(handler=cmd_schemes)
+
+    p = sub.add_parser("info", help="show the scheme binding and memory map")
+    add_elf(p)
+    p.set_defaults(handler=cmd_info)
+
+    p = sub.add_parser("symbols", help="list symbols in the firmware")
+    p.add_argument("elf")
+    p.add_argument("pattern", nargs="?", default="*")
+    p.add_argument("--all", action="store_true", help="include data symbols")
+    p.set_defaults(handler=cmd_symbols)
+
+    p = sub.add_parser("run", help="boot the firmware and print its output")
+    p.add_argument("elf")
+    p.add_argument("--platform", default="mps2-an386", choices=sorted(PLATFORMS))
+    p.add_argument("--max-insns", type=int, default=0, dest="max_insns")
+    p.add_argument("--stream", action="store_true", help="print UART output live")
+    p.set_defaults(handler=cmd_run)
+
+    p = sub.add_parser("roundtrip", help="run one keygen/sign/verify (or KEM) cycle")
+    add_elf(p)
+    p.set_defaults(handler=cmd_roundtrip)
+
+    p = sub.add_parser("profile", help="instruction counts per function")
+    add_elf(p, op_default="sign")
+    p.add_argument("--top", type=int, default=25)
+    p.set_defaults(handler=cmd_profile)
+
+    p = sub.add_parser("calls", help="call tree with per-call instruction cost")
+    add_elf(p, op_default="sign")
+    p.add_argument("--depth", type=int, default=6)
+    p.add_argument("--lines", type=int, default=60)
+    p.add_argument("--min-cost", type=int, default=0, dest="min_cost")
+    p.set_defaults(handler=cmd_calls)
+
+    p = sub.add_parser("trace", help="instruction or memory trace of one function")
+    add_elf(p, op_default="sign")
+    p.add_argument("--func", help="restrict to this function (or a landmark: ntt, keccak, ...)")
+    p.add_argument("--mem", action="store_true", help="trace memory accesses instead")
+    p.add_argument("--regs", action="store_true", help="include register state")
+    p.add_argument("--limit", type=int, default=200_000)
+    p.add_argument("--lines", type=int, default=60)
+    p.add_argument(
+        "--scope",
+        default="call",
+        choices=("call", "body"),
+        help="call: everything run while inside --func, including callees; "
+        "body: only the function's own instructions (much faster)",
+    )
+    p.add_argument("--csv")
+    p.set_defaults(handler=cmd_trace)
+
+    p = sub.add_parser("fault", help="run a fault-injection campaign")
+    add_elf(p)
+    p.add_argument("--func", required=True, help="function to attack (or a landmark)")
+    p.add_argument("--model", default=faultmod.SKIP, choices=faultmod.MODELS)
+    p.add_argument("--stride", type=int, default=1, help="step between fault sites")
+    p.add_argument(
+        "--hit",
+        type=int,
+        default=1,
+        help="which execution of each fault site to hit (1 = the first)",
+    )
+    p.add_argument("--count", type=int, default=1, help="instructions skipped per fault")
+    p.add_argument("--regs", default="r0,r1,r2,r3", help="registers for bitflip_reg")
+    p.add_argument("--budget", type=int, default=100_000_000)
+    p.add_argument("--progress", type=int, default=25)
+    p.add_argument("--csv")
+    p.add_argument(
+        "--no-check",
+        dest="check",
+        action="store_false",
+        help="do not verify the faulty output (faster, fewer classifications)",
+    )
+    p.set_defaults(handler=cmd_fault)
+
+    p = sub.add_parser("leak", help="record a simulated leakage trace")
+    add_elf(p, op_default="sign")
+    p.add_argument("--func", help="window the trace to this function")
+    p.add_argument("--model", default="hd_reg", choices=LEAK_MODELS)
+    p.add_argument("--limit", type=int, default=2_000_000)
+    p.add_argument("--noise", type=float, default=0.0)
+    p.add_argument(
+        "--scope",
+        default="call",
+        choices=("call", "body"),
+        help="call: everything run while inside --func, including callees; "
+        "body: only the function's own instructions (much faster)",
+    )
+    p.add_argument("--out", help="write the trace to .npy or .csv")
+    p.set_defaults(handler=cmd_leak)
+
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.handler(args)
+    except (EmulationError, FileNotFoundError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+# built firmware and its manifests
+firmware/*.elf
+firmware/*.json
+firmware/*.bin
+
+# analysis output
+*.npy
+*.csv
