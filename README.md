@@ -263,6 +263,50 @@ Rough speeds on this machine: 14 MIPS unhooked (a full ML-DSA-44 signature in
 - **Block-level attribution.** `Profiler` and `CallTracer` attribute at basic
   block granularity, so a block interrupted mid-way is charged in full.
 
+## What's general vs scheme-specific
+
+Almost everything is scheme-agnostic. **All of the Dilithium/ML-DSA specifics are
+isolated in one file — `ucpqc/profiles/mldsa.py`** (plus the demo scripts under
+`examples/`); the ten other `ucpqc/` modules work on any firmware.
+
+| Layer | Scope |
+|---|---|
+| `machine`, `elfimage`, `platform` | general — an ARM/Unicorn core, ELF loading, a board |
+| `tracing`, `faults`, `leakage`, `replay` | general — operate on instructions/registers/memory/buffers |
+| `assess`, `report`, `cli` | general — the mode engine and reporting, written against the profile interface |
+| `scheme` | crypto-API-general — auto-detects SIGN/KEM entry points and sizes (ML-DSA, ML-KEM, Falcon, SPHINCS+); not one specific scheme |
+| `detectors` | general — `loo_scores`, `two_key_accuracy`, `tvla_t`, `mmd_test`, `uniformity_divergence`, `band_*` take plain feature matrices |
+| `detectors.matched_filter` | lattice-FS-specific — negacyclic correlation of a sparse ±1 challenge against response polynomials (the Dilithium *family*, not KEMs/hash-sigs) |
+| **`profiles/mldsa.py`** | **Dilithium-specific — everything below** |
+
+The scheme-specific file stacks **three tiers** of specificity, worth separating
+if you extend it:
+
+1. **ML-DSA algorithm** — `expand_challenge` (SampleInBall), the matched-filter
+   `feature`, and the `z`/`s1` decoders.
+2. **The ML-DSA-44 parameter set** — `L=4, K=4, GAMMA1/2, BETA, TAU, ETA,
+   SIGLEN=2420`, the `s1` offset. ML-DSA-65/87 would need different values.
+3. **This firmware build** — the least portable part: the `SIGNING_SITES`
+   addresses (`0x4c7c…0x4e32`), `MASK_ADD`, the `R0_*` addresses, and the
+   `pqcrystals_dilithium_*` symbol names. A different compilation moves every
+   address. (`fault_sites(image)` already takes the image, so these could be
+   *discovered* by disassembly instead of hard-coded — a good hardening step to
+   make the profile work on any `ml-dsa-44` ELF, not just this one.)
+
+The `AnalysisProfile` interface *is* the boundary: everything a new scheme must
+supply is exactly this scheme-specific surface, and everything else is reused.
+
+```
+must write per scheme         reused unchanged (general)
+─────────────────────         ──────────────────────────
+fault_sites()                 machine, elfimage, platform,
+challenge()                   tracing, faults, leakage, replay,
+response_from_signature()     assess (engine), report, cli,
+response_from_output()        scheme (API detection),
+feature()                     detectors (except matched_filter),
+detector_for()  + constants   profiles/__init__ (registry)
+```
+
 ## Layout
 
 ```
