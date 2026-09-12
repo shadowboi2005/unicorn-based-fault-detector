@@ -182,8 +182,7 @@ no engine change.  `ucpqc/profiles/mldsa.py` is the worked example:
 from ucpqc.profiles import AnalysisProfile, register
 
 class FalconProfile(AnalysisProfile):
-    patterns = ("falcon-*",)
-    def fault_sites(self, image): ...          # [(addr, label), ...]
+    patterns = ("falcon-*",)                     # glob -> auto-selected
     def challenge(self, machine, artifact): ...  # per-artifact context
     def response_from_signature(self, art): ...  # sweep-mode response
     def response_from_output(self, buf): ...     # funcskip-mode response
@@ -193,6 +192,8 @@ register(FalconProfile)
 ```
 
 The profile is auto-selected from `scheme.name`; KEM profiles set `op = "decaps"`.
+The sweep `fault_sites` are **auto-discovered** by disassembling the signing
+function (base-class default) — override only for curated/filtered sites.
 
 Implementations of the same algorithm should agree bit for bit under the same
 seeded RNG, which is a good check after adding one:
@@ -287,12 +288,11 @@ if you extend it:
    `feature`, and the `z`/`s1` decoders.
 2. **The ML-DSA-44 parameter set** — `L=4, K=4, GAMMA1/2, BETA, TAU, ETA,
    SIGLEN=2420`, the `s1` offset. ML-DSA-65/87 would need different values.
-3. **This firmware build** — the least portable part: the `SIGNING_SITES`
-   addresses (`0x4c7c…0x4e32`), `MASK_ADD`, the `R0_*` addresses, and the
-   `pqcrystals_dilithium_*` symbol names. A different compilation moves every
-   address. (`fault_sites(image)` already takes the image, so these could be
-   *discovered* by disassembly instead of hard-coded — a good hardening step to
-   make the profile work on any `ml-dsa-44` ELF, not just this one.)
+3. **This firmware build** — the `pqcrystals_dilithium_*` symbol names used by
+   `challenge`/`targets`. These are portable across `ml-dsa-44` builds (symbol
+   names, not addresses). The sweep sites are no longer hard-coded: `fault_sites`
+   discovers them by disassembling the signing function, so the profile works on
+   any `ml-dsa-44` ELF, not just this one.
 
 **MAYO** (multivariate, a NIST additional-signatures candidate) is a second,
 non-lattice worked example.  It *runs* on the general core with nothing added —
@@ -309,14 +309,14 @@ The `AnalysisProfile` interface *is* the boundary: everything a new scheme must
 supply is exactly this scheme-specific surface, and everything else is reused.
 
 ```
-must write per scheme         reused unchanged (general)
-─────────────────────         ──────────────────────────
-fault_sites()                 machine, elfimage, platform,
-challenge()                   tracing, faults, replay,
-response_from_signature()     assess (engine), report, cli,
-response_from_output()        scheme (API detection),
-feature()                     detectors (except matched_filter),
-detector_for()  + constants   profiles/__init__ (registry)
+must write per scheme         auto / optional (defaulted)      reused unchanged (general)
+─────────────────────         ───────────────────────────      ──────────────────────────
+patterns  (glob)              fault_sites() (disassembly)      machine, elfimage, platform,
+challenge()                   detector_for() (-> two_key)      tracing, faults, replay,
+response_from_signature()     targets() (probe_target.py,      assess (engine), report, cli,
+response_from_output()          opt-in; else hand-written)     scheme (API detection),
+feature()      + constants    setup(), artifact_len, op        detectors (except matched_filter),
+                                                               profiles/__init__ (registry)
 ```
 
 ## Layout
