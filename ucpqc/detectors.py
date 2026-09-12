@@ -18,8 +18,9 @@ right detector depends on the faulted quantity's *role*:
 import numpy as np
 
 __all__ = [
-    "matched_filter", "loo_scores", "two_key_accuracy", "tvla_t", "perm_pvalue",
-    "mmd_test", "uniformity_divergence", "band_count", "band_levene",
+    "matched_filter", "loo_scores", "two_key_accuracy", "tvla_t", "tvla_max",
+    "lda_accuracy", "perm_pvalue", "mmd_test", "uniformity_divergence",
+    "band_count", "band_levene",
 ]
 
 
@@ -85,6 +86,66 @@ def tvla_t(F0, F1):
     denom = np.sqrt(v0 / n0 + v1 / n1)
     denom = np.where(denom == 0, np.inf, denom)      # constant coords -> t = 0
     return (m0 - m1) / denom
+
+
+def tvla_max(F0, F1):
+    """Detector A -- per-coordinate leak localization.
+
+    Reduces the per-coordinate TVLA (:func:`tvla_t`) to one statistic: the
+    maximum ``|t|`` over all D coordinates, plus how many coordinates clear the
+    classic 4.5 threshold.  Where ``two_key_accuracy`` builds one whole-vector
+    mean template (and so *dilutes* a leak that lives in a few coordinates across
+    all D dims), this asks "does ANY single output position separate the keys?"
+    -- catching a secret coefficient exposed at a fixed byte.  The caller applies
+    a multiple-comparison-corrected threshold (D coordinates were tested).
+    Returns ``(max_abs_t, n_over_4p5)``."""
+    at = np.abs(tvla_t(F0, F1))
+    return (float(np.nanmax(at)) if at.size else 0.0,
+            int(np.sum(at > 4.5)))
+
+
+def lda_accuracy(F0, F1, shrink=0.1):
+    """Detector B -- covariance-aware (structural) separability.
+
+    The generalization of :func:`two_key_accuracy`: whiten both populations by
+    their pooled within-key covariance (shrunk toward a scaled identity so it
+    inverts when D >> N), then run the same leave-one-out nearest-mean classifier
+    in the whitened space.  Nearest-mean (``two_key``) assumes identity
+    covariance and so only sees a whole-vector *mean shift*; after whitening the
+    same classifier is a regularized linear discriminant that also separates keys
+    differing in a **low-dimensional / correlated subspace** -- the structure the
+    piece-by-piece accumulation attacks (faulted outputs confined to a
+    key-dependent subspace, e.g. MAYO's oil space; Dilithium's ``z = c*s1``)
+    reveal but a mean template misses.  ``two_key`` is the ``shrink=1`` (identity
+    whitening) special case; per-coordinate (:func:`tvla_max`) is the diagonal
+    case.  Returns leave-one-out accuracy in ``[0, 1]`` (0.5 = chance).
+
+    LDA needs an estimable within-key covariance, so when D >> N we first project
+    onto the top ``<= N-2`` principal components of the pooled data; this bounds
+    the covariance rank and stops the whitening from over-fitting spurious
+    high-dimensional directions (which otherwise inflates accuracy on pure noise).
+    Even so, treat B as trustworthy only with N well above the retained component
+    count -- at small N it is optimistic and should be permutation-calibrated."""
+    F0, F1 = np.asarray(F0, float), np.asarray(F1, float)
+    n0, n1 = len(F0), len(F1)
+    if n0 < 2 or n1 < 2:
+        return two_key_accuracy(F0, F1)
+    X = np.vstack([F0, F1])
+    X = X[:, None] if X.ndim == 1 else X
+    Xc = X - X.mean(0)
+    ncomp = max(1, min(X.shape[1], n0 + n1 - 2))            # bound cov rank at N-2
+    _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
+    P = Vt[:ncomp].T                                        # D x ncomp PCA basis
+    G0, G1 = F0 @ P, F1 @ P
+    d = ncomp
+    C0, C1 = G0 - G0.mean(0), G1 - G1.mean(0)
+    S = (C0.T @ C0 + C1.T @ C1) / max(n0 + n1 - 2, 1)       # pooled within-key cov
+    S = np.atleast_2d(S)
+    mu = np.trace(S) / d
+    Sr = (1.0 - shrink) * S + shrink * mu * np.eye(d)       # shrink -> invertible
+    vals, vecs = np.linalg.eigh(Sr)
+    W = vecs @ np.diag(np.clip(vals, 1e-12, None) ** -0.5) @ vecs.T   # Sr^{-1/2}
+    return two_key_accuracy(G0 @ W, G1 @ W)                 # nearest-mean, whitened
 
 
 def perm_pvalue(F0, F1, n_perm=2000, rng=None):

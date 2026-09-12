@@ -410,7 +410,7 @@ def build_parser():
     add_elf(p)
     p.add_argument("--n", type=int, default=24, help="signatures per key")
     p.add_argument("--detector", default="two_key",
-                   choices=("two_key", "uniformity", "spec_aware"))
+                   choices=("two_key", "per_coord", "subspace", "uniformity", "spec_aware"))
     p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
     p.add_argument("--plot", help="directory to write the result bar chart into")
     p.set_defaults(handler=cmd_sweep)
@@ -421,7 +421,7 @@ def build_parser():
     p.add_argument("--target", help="named funcskip target (default: the profile's)")
     p.add_argument("--n", type=int, default=24, help="signatures per key")
     p.add_argument("--detector", default=None,
-                   choices=("two_key", "uniformity", "spec_aware"),
+                   choices=("two_key", "per_coord", "subspace", "uniformity", "spec_aware"),
                    help="override the profile's detector for the target")
     p.add_argument("--backend", default="call", choices=("call", "snapshot"))
     p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")

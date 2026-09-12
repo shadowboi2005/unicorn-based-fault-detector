@@ -76,6 +76,14 @@ def _operation(scheme):
     return "decaps"
 
 
+def _tvla_threshold(d, alpha=1e-5):
+    """Bonferroni-corrected |t| threshold for a maximum over ``d`` coordinates at
+    family-wise level ``alpha`` (two-sided), via a normal approximation -- so a
+    single coordinate crossing it is a real leak, not one of D chances at noise."""
+    from scipy import stats
+    return float(stats.norm.isf(0.5 * alpha / max(d, 1)))
+
+
 def _detector_metric(name, feats, profile):
     """Aggregate per-key feature lists into (metric, is_leak) for a detector."""
     A = np.array(feats["A"]); B = np.array(feats.get("B", []))
@@ -84,6 +92,17 @@ def _detector_metric(name, feats, profile):
             return None, False
         acc = detectors.two_key_accuracy(A, B)
         return acc, acc >= LEAK_THRESHOLD
+    if name == "subspace":                    # detector B: covariance-aware LDA
+        if len(A) < 3 or len(B) < 3:
+            return None, False
+        acc = detectors.lda_accuracy(A, B)
+        return acc, acc >= LEAK_THRESHOLD
+    if name == "per_coord":                   # detector A: per-coordinate max|t|
+        if len(A) < 3 or len(B) < 3:
+            return None, False
+        max_t, _ = detectors.tvla_max(A, B)
+        d = A.shape[1] if A.ndim > 1 else 1
+        return max_t, max_t >= _tvla_threshold(d)
     if name == "uniformity":
         if len(A) < 1:
             return None, False
@@ -229,7 +248,9 @@ def _make_featurize(profile, detector):
     """Build the funcskip featurizer (shared by serial + parallel)."""
     def featurize(cap, out):
         resp = profile.response_from_output(out)
-        if detector == "two_key":
+        # two_key / per_coord / subspace are different classifiers over the SAME
+        # (challenge-aware) feature; only the raw-coefficient detectors bypass it.
+        if detector in ("two_key", "per_coord", "subspace"):
             return profile.feature(cap.c, resp)
         return resp.ravel()                            # uniformity / spec_aware
     return featurize
