@@ -10,7 +10,7 @@ import struct
 
 import numpy as np
 
-from ..detectors import matched_filter
+from ..detectors import PrimeField, matched_filter
 from ..replay import Target
 from . import AnalysisProfile, register
 
@@ -29,11 +29,55 @@ POLYZ_BYTES = N_COEFFS * 18 // 8
 SIGLEN = CTILDE_BYTES + POLYZ_BYTES * L + 84
 POLYVECL_BYTES = L * N_COEFFS * 4
 R0_BOUND = GAMMA2 - BETA                     # gamma2 - beta, the r0 reject bound
+PSI = 1753                                   # primitive 512th root of unity mod Q
+
+
+# -- negacyclic deconvolution over Z_q (for the structural feature) ---------
+# The response z = c*s1 (mod X^256+1, mod Q) once the mask y is skipped.  With c
+# known we recover s1 = z * c^{-1}: transform to the NTT domain (where negacyclic
+# convolution is pointwise), divide by c, transform back.  When leaking, every
+# signature yields the SAME s1 -> the rows collapse to rank 1; when masked, z is
+# randomised so the recovered rows are full rank.
+_NTT = {}
+
+
+def _ntt_matrices():
+    if _NTT:
+        return _NTT["fwd"], _NTT["inv"]
+    n, q, psi = N_COEFFS, Q, PSI
+    omega = psi * psi % q                              # 256th root of unity
+    i = np.arange(n, dtype=np.int64)
+    psi_i = np.array([pow(psi, int(t), q) for t in range(n)], dtype=np.int64)
+    ik = np.outer(i, i) % n
+    om_pow = np.array([pow(omega, int(e), q) for e in range(n)], dtype=np.int64)
+    fwd = (psi_i[None, :] * om_pow[ik.T % n]) % q       # X[k] = sum_i x[i] psi^i omega^{ik}
+    ninv = pow(n, q - 2, q)
+    psi_inv_i = np.array([pow(psi, (-int(t)) % (2 * n), q) for t in range(n)], dtype=np.int64)
+    ominv_pow = np.array([pow(omega, (-int(e)) % n, q) for e in range(n)], dtype=np.int64)
+    inv = ((psi_inv_i[:, None] * ominv_pow[ik % n]) % q * ninv) % q   # mod between mults (avoid int64 overflow)
+    _NTT["fwd"], _NTT["inv"] = fwd, inv
+    return fwd, inv
+
+
+def negacyclic_deconv(c, z):
+    """Recover per-poly ``s1`` estimates from ``z`` given challenge ``c`` over Z_q.
+    ``c`` is length-256, ``z`` is ``(L, 256)``; returns ``(L, 256)`` in ``[0, Q)``."""
+    fwd, inv = _ntt_matrices()
+    q = Q
+    c = np.asarray(c, dtype=np.int64) % q
+    z = np.asarray(z, dtype=np.int64) % q
+    C = (fwd @ c) % q                                  # challenge in the NTT domain
+    Cinv = np.array([pow(int(v), q - 2, q) if v % q else 0 for v in C], dtype=np.int64)
+    Z = (z @ fwd.T) % q                                # (L, 256) responses -> NTT domain
+    S = (Z * Cinv[None, :]) % q                         # pointwise divide by c
+    return (S @ inv.T) % q                              # back to coefficient domain
+
 
 class MLDSAProfile(AnalysisProfile):
     patterns = ("ml-dsa-*", "dilithium*")
     op = "sign"
     artifact_len = SIGLEN
+    field = PrimeField(Q)                    # Dilithium coefficients live in Z_q
 
     def __init__(self):
         self._cbuf = None                    # persistent scratch for poly_challenge
@@ -80,6 +124,14 @@ class MLDSAProfile(AnalysisProfile):
 
     def feature(self, context, response):
         return matched_filter(context, response)
+
+    def structural_feature(self, context, response):
+        """Row of Z_q elements for the structural detector: the per-signature
+        `s1` estimate recovered by deconvolving the challenge `c` (`context`) from
+        the response `z`.  When the mask is off (`z = c*s1`) every signature
+        yields the same `s1`, so the rows collapse to a rank-1, key-dependent
+        subspace; when masked, `z` is randomised and the rows stay full rank."""
+        return negacyclic_deconv(context, response).ravel().astype(int)
 
     # -- targets / detector role -------------------------------------------
     #: the r0 reject bound, used by the spec-aware detector

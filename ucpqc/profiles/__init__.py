@@ -46,6 +46,9 @@ class AnalysisProfile:
     artifact_len = 0
     #: default funcskip target (a symbol name or a replay.Target), or None
     default_target = None
+    #: arithmetic backend for the "structural" detector (a detectors.Field), or
+    #: None if the scheme supplies no field-aware structural feature yet
+    field = None
 
     # -- lifecycle ----------------------------------------------------------
     def setup(self, machine):
@@ -84,6 +87,18 @@ class AnalysisProfile:
     def feature(self, context, response):
         """Combine context + response into a detector feature vector (e.g. the
         matched filter of `c` against the response)."""
+        raise NotImplementedError
+
+    def structural_feature(self, context, response):
+        """Map one (context, response) into a row of FIELD ELEMENTS over
+        ``self.field`` for the "structural" detector -- built so a leak shows up
+        as a low-rank, key-dependent subspace.  Distinct from ``feature`` (a
+        real-valued classifier feature): the structural leak is *algebraic*.
+        Where the leak lives is the scheme's job to express (e.g. MAYO: the
+        exposed oil bytes as GF(16) elements; Dilithium: the per-signature ``s1``
+        estimate over Z_q, deconvolving the known challenge from the response).
+        Only needed if the profile sets ``field`` and offers the "structural"
+        detector.  Default: unsupported."""
         raise NotImplementedError
 
     # -- detector role mapping ----------------------------------------------

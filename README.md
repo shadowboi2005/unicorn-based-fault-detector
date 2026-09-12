@@ -186,7 +186,7 @@ class FalconProfile(AnalysisProfile):
     def challenge(self, machine, artifact): ...  # per-artifact context
     def response_from_signature(self, art): ...  # sweep-mode response
     def response_from_output(self, buf): ...     # funcskip-mode response
-    def feature(self, context, response): ...    # -> feature vector
+    def feature(self, context, response): ...    # -> real-valued classifier feature
 
 register(FalconProfile)
 ```
@@ -194,6 +194,23 @@ register(FalconProfile)
 The profile is auto-selected from `scheme.name`; KEM profiles set `op = "decaps"`.
 The sweep `fault_sites` are **auto-discovered** by disassembling the signing
 function (base-class default) — override only for curated/filtered sites.
+
+**What a new algorithm must supply**, by which detector you want:
+
+| detector | what the profile must add | example |
+|---|---|---|
+| `two_key` / `per_coord` / `subspace` | `challenge`, `response_from_*`, `feature` (a real-valued, ideally leak-aligned feature — e.g. Dilithium's matched filter) | `MLDSAProfile.feature` |
+| `uniformity` / `spec_aware` | the raw-coefficient response + the relevant bound (`reject_bound`) | `MLDSAProfile.reject_bound` |
+| `structural` (field-aware) | `field` (a `detectors.Field`: `PrimeField(q)`, `GF2m(m)`, …) **and** `structural_feature(context, response)` returning a row of **field elements** built so a leak shows as a low-rank, key-dependent subspace | `MLDSAProfile` (`PrimeField(Q)` + `s1` deconvolution), `MayoProfile` (`GF2m(4)` + oil bytes) |
+| `funcskip` mode | `targets()` / `default_target` (a `replay.Target`: function, arg layout, output) | `MLDSAProfile.targets` |
+
+`challenge`/`response_from_*`/`feature` are the minimum to run any two-key-family
+sweep; `field`+`structural_feature` are the extra pair for the field-aware
+structural detector, and `targets()` is the extra piece for the intra-function
+`funcskip` mode. Everything else (fault-site discovery, the mode engine, the
+detectors themselves) is scheme-agnostic. The **structural feature is where the
+scheme's algebra enters** — it is the piece expected to be supplied per scheme
+when scanning it (the framework does not infer the leak's algebraic form).
 
 Implementations of the same algorithm should agree bit for bit under the same
 seeded RNG, which is a good check after adding one:
@@ -315,8 +332,9 @@ patterns  (glob)              fault_sites() (disassembly)      machine, elfimage
 challenge()                   detector_for() (-> two_key)      tracing, faults, replay,
 response_from_signature()     targets() (probe_target.py,      assess (engine), report, cli,
 response_from_output()          opt-in; else hand-written)     scheme (API detection),
-feature()      + constants    setup(), artifact_len, op        detectors (except matched_filter),
-                                                               profiles/__init__ (registry)
+feature()      + constants    setup(), artifact_len, op        detectors (incl. the field
+field + structural_feature()  field=None (structural off)        backends; except matched_filter),
+  (only for structural)                                        profiles/__init__ (registry)
 ```
 
 ## Layout

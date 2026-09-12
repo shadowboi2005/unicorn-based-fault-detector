@@ -19,7 +19,8 @@ import numpy as np
 
 __all__ = [
     "matched_filter", "loo_scores", "two_key_accuracy", "tvla_t", "tvla_max",
-    "lda_accuracy", "perm_pvalue", "mmd_test", "uniformity_divergence",
+    "lda_accuracy", "Field", "PrimeField", "GF2m", "structural_leak",
+    "perm_pvalue", "mmd_test", "uniformity_divergence",
     "band_count", "band_levene",
 ]
 
@@ -146,6 +147,126 @@ def lda_accuracy(F0, F1, shrink=0.1):
     vals, vecs = np.linalg.eigh(Sr)
     W = vecs @ np.diag(np.clip(vals, 1e-12, None) ** -0.5) @ vecs.T   # Sr^{-1/2}
     return two_key_accuracy(G0 @ W, G1 @ W)                 # nearest-mean, whitened
+
+
+# --------------------------------------------------------------------------
+# field-parameterized structural / recoverability detector -- the algebra-aware
+# generalization of B: a leak shows as the faulted outputs collapsing to a
+# low-dimensional, key-dependent subspace OVER THE SCHEME'S OWN FIELD.  The
+# arithmetic (rank over the field) is a pluggable backend so one detector serves
+# GF(16) (MAYO) and Z_q (Dilithium) alike; the scheme supplies the feature rows.
+# --------------------------------------------------------------------------
+class Field:
+    """Linear algebra over a scheme's algebra.  Subclasses implement ``rank`` of
+    an integer matrix over the field; that is all ``structural_leak`` needs."""
+    name = "field"
+
+    def rank(self, M):                        # pragma: no cover - interface
+        raise NotImplementedError
+
+
+class PrimeField(Field):
+    """GF(p) for a prime modulus -- Dilithium's coefficient field Z_q."""
+
+    def __init__(self, p):
+        self.p = int(p)
+        self.name = f"GF({p})"
+
+    def rank(self, M):
+        p = self.p
+        A = (np.asarray(M, dtype=object) % p).tolist()      # exact integer mod p
+        rows, cols = len(A), (len(A[0]) if A else 0)
+        r = 0
+        for c in range(cols):
+            piv = next((i for i in range(r, rows) if A[i][c] % p), None)
+            if piv is None:
+                continue
+            A[r], A[piv] = A[piv], A[r]
+            inv = pow(A[r][c], p - 2, p)                     # Fermat inverse (p prime)
+            A[r] = [(v * inv) % p for v in A[r]]
+            for i in range(rows):
+                if i != r and A[i][c] % p:
+                    f = A[i][c]
+                    A[i] = [(a - f * b) % p for a, b in zip(A[i], A[r])]
+            r += 1
+            if r == rows:
+                break
+        return r
+
+
+class GF2m(Field):
+    """GF(2^m) via log/antilog tables (add = XOR) -- MAYO's field is GF(16)."""
+
+    def __init__(self, m=4, poly=0x13):
+        self.m, self.q = m, 1 << m
+        self.name = f"GF(2^{m})"
+        self._exp = [0] * (2 * self.q); self._log = [0] * self.q
+        x = 1
+        for i in range(self.q - 1):
+            self._exp[i] = x; self._log[x] = i
+            x <<= 1
+            if x & self.q:
+                x ^= poly
+        for i in range(self.q - 1, 2 * self.q):
+            self._exp[i] = self._exp[i - (self.q - 1)]
+
+    def _mul(self, a, b):
+        return 0 if a == 0 or b == 0 else self._exp[self._log[a] + self._log[b]]
+
+    def _inv(self, a):
+        return self._exp[(self.q - 1) - self._log[a]]
+
+    def rank(self, M):
+        A = [[int(v) & (self.q - 1) for v in row] for row in np.asarray(M).tolist()]
+        rows, cols = len(A), (len(A[0]) if A else 0)
+        r = 0
+        for c in range(cols):
+            piv = next((i for i in range(r, rows) if A[i][c]), None)
+            if piv is None:
+                continue
+            A[r], A[piv] = A[piv], A[r]
+            inv = self._inv(A[r][c])
+            A[r] = [self._mul(v, inv) for v in A[r]]
+            for i in range(rows):
+                if i != r and A[i][c]:
+                    f = A[i][c]
+                    A[i] = [a ^ self._mul(f, b) for a, b in zip(A[i], A[r])]
+            r += 1
+            if r == rows:
+                break
+        return r
+
+
+def structural_leak(F0, F1, field):
+    """Detector B* -- field-aware structural / recoverability test.
+
+    ``F0``/``F1`` are ``(N, D)`` integer matrices of FIELD ELEMENTS (the scheme's
+    structural feature, e.g. MAYO's exposed oil bytes over GF(16), or Dilithium's
+    per-signature ``s1`` estimate over Z_q).  A genuine leak makes each key's rows
+    collapse to a low-dimensional subspace over ``field`` and makes the two keys'
+    subspaces *differ* -- the structure accumulation attacks reveal and solve.
+    Returns ``(score in [0,1], is_leak)``::
+
+        collapse   = 1 - max(rank F0, rank F1) / full   # each key in few dims
+        separation = (rank[F0;F1] - max) / min(rank)    # subspaces are key-specific
+        score      = collapse * separation
+
+    Golden/masked outputs stay full-rank -> collapse ~ 0 -> no leak."""
+    F0 = np.asarray(F0); F1 = np.asarray(F1)
+    if F0.ndim == 1:
+        F0 = F0[:, None]; F1 = F1[:, None]
+    # per-key ambient rank: a non-leaking key is full-rank (rank == its own N),
+    # so collapse == 0; only a genuine subspace collapse (rank << N) is flagged.
+    full = min(min(F0.shape[0], F1.shape[0]), F0.shape[1])
+    rA, rB = field.rank(F0), field.rank(F1)
+    rAB = field.rank(np.vstack([F0, F1]))
+    collapse = 1.0 - max(rA, rB) / max(full, 1)
+    separation = (rAB - max(rA, rB)) / max(min(rA, rB), 1)
+    score = max(0.0, collapse) * max(0.0, separation)
+    return float(score), score >= STRUCTURAL_THRESHOLD
+
+
+STRUCTURAL_THRESHOLD = 0.5                    # score below which no structural leak
 
 
 def perm_pvalue(F0, F1, n_perm=2000, rng=None):

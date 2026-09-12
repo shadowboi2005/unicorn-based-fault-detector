@@ -97,6 +97,10 @@ def _detector_metric(name, feats, profile):
             return None, False
         acc = detectors.lda_accuracy(A, B)
         return acc, acc >= LEAK_THRESHOLD
+    if name == "structural":                  # detector B*: field-aware structural
+        if profile.field is None or len(A) < 3 or len(B) < 3:
+            return None, False
+        return detectors.structural_leak(A, B, profile.field)
     if name == "per_coord":                   # detector A: per-coordinate max|t|
         if len(A) < 3 or len(B) < 3:
             return None, False
@@ -167,8 +171,12 @@ def _run_site(scheme, profile, sk, messages, site, label, detector, budget):
                         crashed += 1
                         raise _Unstable
                     c = profile.challenge(m, art)
+                    resp = profile.response_from_signature(art)
+                    # structural uses the field-element feature; all others use
+                    # the real-valued classifier feature (unchanged path)
                     feats[key].append(
-                        profile.feature(c, profile.response_from_signature(art)))
+                        profile.structural_feature(c, resp) if detector == "structural"
+                        else profile.feature(c, resp))
             except _Unstable:
                 unstable = True
                 break
@@ -252,6 +260,8 @@ def _make_featurize(profile, detector):
         # (challenge-aware) feature; only the raw-coefficient detectors bypass it.
         if detector in ("two_key", "per_coord", "subspace"):
             return profile.feature(cap.c, resp)
+        if detector == "structural":
+            return profile.structural_feature(cap.c, resp)
         return resp.ravel()                            # uniformity / spec_aware
     return featurize
 
