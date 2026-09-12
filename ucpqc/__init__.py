@@ -38,7 +38,7 @@ from .platform import MPS2_AN386, PLATFORMS, Platform, Region
 from .scheme import KEM, SIGN, Scheme, SchemeError, detect
 from .tracing import CallTracer, InstructionTracer, MemoryTracer, Profiler, Trigger
 from .replay import Capture, Recorder, Target, benchmark_backends, replay, skip_sweep
-from . import assess, detectors, profiles, report
+from . import assess, detectors, parallel, profiles, report
 
 __version__ = "0.1.0"
 
@@ -80,6 +80,7 @@ __all__ = [
     "Trigger",
     "assess",
     "detect",
+    "parallel",
     "profiles",
     "report",
     "sweep_function_body",

@@ -272,7 +272,16 @@ def _emit(args, result):
 
 def cmd_sweep(args):
     """Whole-call fault sweep over the operation's inner loop (ALAFA-style)."""
-    m, scheme = _machine(args)
+    if args.jobs != 1:                            # parallel (multiprocessing) path
+        from . import parallel
+        result = parallel.sweep_sites_parallel(
+            args.elf, platform_name=args.platform, n=args.n,
+            detector=args.detector, jobs=args.jobs, seed=args.seed.encode(),
+            profile_override=getattr(args, "profile", None),
+            calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
+            fdr_q=args.fdr, correction=args.correction)
+        return _emit(args, result)
+    m, scheme = _machine(args)                    # serial reference path
     profile = _profile(args, scheme)
     result = assessmod.sweep_sites(scheme, profile, n=args.n, detector=args.detector,
                                    calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
@@ -298,7 +307,18 @@ def cmd_detect(args):
 
 def cmd_funcskip(args):
     """Instruction-skip sweep inside one function, via capture-and-replay."""
-    m, scheme = _machine(args)
+    if args.jobs != 1 and args.backend != "snapshot":   # parallel (call backend)
+        from . import parallel
+        result = parallel.sweep_function_parallel(
+            args.elf, platform_name=args.platform, target_name=args.target,
+            n=args.n, detector=args.detector, backend=args.backend,
+            jobs=args.jobs, seed=args.seed.encode(),
+            profile_override=getattr(args, "profile", None),
+            calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
+            fdr_q=args.fdr, correction=args.correction)
+        if result is not None:
+            return _emit(args, result)
+    m, scheme = _machine(args)                    # serial path (also snapshot fallback)
     profile = _profile(args, scheme)
     target = None
     if args.target:
@@ -469,6 +489,8 @@ def build_parser():
                    help="also write the golden + faulty runs (artifact + challenge per "
                         "item) as JSON to DIR (default 'dump'), for offline replay with "
                         "`ucpqc detect` -- no re-emulation")
+    p.add_argument("-j", "--jobs", type=int, default=1,
+                   help="parallel worker processes (1=serial, 0=auto/all CPUs)")
     _add_calibration_flags(p)
     p.set_defaults(handler=cmd_sweep)
 
@@ -493,6 +515,8 @@ def build_parser():
     p.add_argument("--backend", default="call", choices=("call", "snapshot"))
     p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
     p.add_argument("--plot", help="directory to write the result bar chart into")
+    p.add_argument("-j", "--jobs", type=int, default=1,
+                   help="parallel worker processes (1=serial, 0=auto/all CPUs)")
     _add_calibration_flags(p)
     p.set_defaults(handler=cmd_funcskip)
 
