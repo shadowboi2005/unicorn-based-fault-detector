@@ -87,8 +87,10 @@ def _worker_init(elf_path, platform_name, keys, n, detector, budget, seed,
     deterministic inputs (keys, messages, site labels)."""
     m, scheme, profile = _build_bound_machine(elf_path, platform_name, seed,
                                               profile_override)
-    profile.setup(m)
+    # same order as assess.sweep_sites (keys then setup) so the clean state each
+    # site is isolated to is byte-identical to the serial engine's
     sk = {k: _assess._keypair(scheme, s)[1] for k, s in zip("AB", keys)}
+    profile.setup(m)
     sites = dict(profile.fault_sites(m, _op_func(scheme)))
     if site_filter is not None:
         sites = {a: sites[a] for a in site_filter if a in sites}
