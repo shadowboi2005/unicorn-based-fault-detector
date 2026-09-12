@@ -174,20 +174,18 @@ class PrimeField(Field):
 
     def rank(self, M):
         p = self.p
-        A = (np.asarray(M, dtype=object) % p).tolist()      # exact integer mod p
-        rows, cols = len(A), (len(A[0]) if A else 0)
+        A = np.atleast_2d(np.asarray(M, dtype=np.int64) % p).copy()
+        rows, cols = A.shape
         r = 0
-        for c in range(cols):
-            piv = next((i for i in range(r, rows) if A[i][c] % p), None)
-            if piv is None:
+        for c in range(cols):                               # numpy Gaussian elim mod p
+            nz = np.nonzero(A[r:, c])[0]
+            if nz.size == 0:
                 continue
-            A[r], A[piv] = A[piv], A[r]
-            inv = pow(A[r][c], p - 2, p)                     # Fermat inverse (p prime)
-            A[r] = [(v * inv) % p for v in A[r]]
-            for i in range(rows):
-                if i != r and A[i][c] % p:
-                    f = A[i][c]
-                    A[i] = [(a - f * b) % p for a, b in zip(A[i], A[r])]
+            piv = r + int(nz[0])
+            A[[r, piv]] = A[[piv, r]]
+            A[r] = (A[r] * pow(int(A[r, c]), p - 2, p)) % p  # normalise pivot (Fermat inverse)
+            factors = A[:, c].copy(); factors[r] = 0         # clear column c in every other row
+            A = (A - np.outer(factors, A[r])) % p            # products < p^2 < 2^63 -> int64-safe
             r += 1
             if r == rows:
                 break

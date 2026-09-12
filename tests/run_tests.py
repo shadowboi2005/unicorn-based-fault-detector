@@ -383,6 +383,43 @@ def test_mayo_runs_and_selects_profile():
     assert scheme.verify(scheme.sign(b"hi", sk), b"hi", pk)
 
 
+# --- structural-detector field math (pure; no external oracle) --------------
+
+
+def test_ring_deconv_recovers_s1():
+    """The structural feature's Z_q ring deconvolution recovers s1 from z=c*s1."""
+    import numpy as np
+    from ucpqc.profiles.mldsa import negacyclic_deconv, Q, N_COEFFS as n, TAU
+    rng = np.random.default_rng(0)
+    s1 = rng.integers(0, Q, size=(2, n))
+    c = np.zeros(n, dtype=int)
+    c[rng.choice(n, TAU, replace=False)] = rng.choice([1, Q - 1], TAU)  # sparse +-1
+
+    def negconv(a, b):                       # reference z = a*b mod (x^n+1, Q)
+        lin = np.zeros(2 * n - 1, dtype=object)
+        for i in range(n):
+            if a[i]:
+                for j in range(n):
+                    lin[i + j] = (lin[i + j] + int(a[i]) * int(b[j])) % Q
+        return np.array([(lin[k] - (lin[k + n] if k + n < 2 * n - 1 else 0)) % Q
+                         for k in range(n)], dtype=object)
+
+    z = np.array([negconv(c, s1[r]) for r in range(2)], dtype=object)
+    assert np.array_equal(negacyclic_deconv(c, z) % Q, s1 % Q), "must recover s1"
+
+
+def test_field_rank_known():
+    """Hand-rolled GF(q) and GF(16) ranks on matrices with known rank."""
+    import numpy as np
+    from ucpqc.detectors import PrimeField, GF2m
+    full = np.eye(4, dtype=int) * 3                       # rank 4 (3 is a unit)
+    deficit = np.array([[1, 1, 0, 0], [1, 1, 0, 0],       # row 0 duplicated -> rank 3
+                        [0, 0, 1, 0], [0, 0, 0, 1]], dtype=int)
+    for F in (PrimeField(8380417), GF2m(4)):
+        assert F.rank(full) == 4, f"{F.name} full rank"
+        assert F.rank(deficit) == 3, f"{F.name} rank deficit"
+
+
 # --- runner -----------------------------------------------------------------
 
 

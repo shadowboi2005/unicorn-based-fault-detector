@@ -1,0 +1,10 @@
+# Test-only dependencies. Install into the standard 3.12 .venv to run the
+# oracle tests (tests/test_field_oracle.py), which cross-check the hand-rolled
+# numpy field arithmetic against a trusted reference.
+#
+#   .venv/bin/pip install -r requirements-dev.txt
+#
+# NOT a runtime dependency, and NOT for the free-threaded .venv314t: galois pulls
+# in numba, which has no free-threaded build and would re-enable the GIL.
+-r requirements.txt
+galois>=0.3        # trusted GF(2^m) / GF(p) linear-algebra oracle

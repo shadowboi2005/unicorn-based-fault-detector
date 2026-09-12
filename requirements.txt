@@ -2,3 +2,4 @@ unicorn>=2.0.0
 capstone>=5.0
 pyelftools>=0.29
 numpy>=1.24   # optional: only needed for .npy traces, noise and CPA correlation
+sympy>=1.12   # pure-Python; the Z_q ring inverse behind the structural detector

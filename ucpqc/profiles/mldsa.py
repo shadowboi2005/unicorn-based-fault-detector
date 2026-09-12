@@ -29,48 +29,60 @@ POLYZ_BYTES = N_COEFFS * 18 // 8
 SIGLEN = CTILDE_BYTES + POLYZ_BYTES * L + 84
 POLYVECL_BYTES = L * N_COEFFS * 4
 R0_BOUND = GAMMA2 - BETA                     # gamma2 - beta, the r0 reject bound
-PSI = 1753                                   # primitive 512th root of unity mod Q
 
 
 # -- negacyclic deconvolution over Z_q (for the structural feature) ---------
 # The response z = c*s1 (mod X^256+1, mod Q) once the mask y is skipped.  With c
-# known we recover s1 = z * c^{-1}: transform to the NTT domain (where negacyclic
-# convolution is pointwise), divide by c, transform back.  When leaking, every
-# signature yields the SAME s1 -> the rows collapse to rank 1; when masked, z is
-# randomised so the recovered rows are full rank.
-_NTT = {}
+# known we recover s1 = z * c^{-1} in the ring Z_q[x]/(x^256+1); when leaking,
+# every signature yields the SAME s1 -> the rows collapse to rank 1, while masked
+# z stays full rank.  The polynomial-ring inverse is done by sympy (a well-tested
+# library) rather than a hand-rolled NTT.  sympy is pure-Python, so this stays
+# free-threading-safe (no GIL re-enable on the 3.14t venv).
+from sympy import GF as _GF, Poly as _Poly, invert as _invert, symbols as _symbols  # noqa: E402
+from sympy.polys.polyerrors import NotInvertible as _NotInvertible                  # noqa: E402
+
+_X = _symbols("x")
+_RING = {}                                   # lazy: {dom, g = x^N + 1}
+_CINV = {}                                   # cache: c.bytes -> c^{-1} Poly (or None)
 
 
-def _ntt_matrices():
-    if _NTT:
-        return _NTT["fwd"], _NTT["inv"]
-    n, q, psi = N_COEFFS, Q, PSI
-    omega = psi * psi % q                              # 256th root of unity
-    i = np.arange(n, dtype=np.int64)
-    psi_i = np.array([pow(psi, int(t), q) for t in range(n)], dtype=np.int64)
-    ik = np.outer(i, i) % n
-    om_pow = np.array([pow(omega, int(e), q) for e in range(n)], dtype=np.int64)
-    fwd = (psi_i[None, :] * om_pow[ik.T % n]) % q       # X[k] = sum_i x[i] psi^i omega^{ik}
-    ninv = pow(n, q - 2, q)
-    psi_inv_i = np.array([pow(psi, (-int(t)) % (2 * n), q) for t in range(n)], dtype=np.int64)
-    ominv_pow = np.array([pow(omega, (-int(e)) % n, q) for e in range(n)], dtype=np.int64)
-    inv = ((psi_inv_i[:, None] * ominv_pow[ik % n]) % q * ninv) % q   # mod between mults (avoid int64 overflow)
-    _NTT["fwd"], _NTT["inv"] = fwd, inv
-    return fwd, inv
+def _ring():
+    if not _RING:
+        dom = _GF(Q, symmetric=False)        # Z_q with representatives in [0, Q)
+        _RING["dom"] = dom
+        _RING["g"] = _Poly(_X ** N_COEFFS + 1, _X, domain=dom)
+    return _RING["dom"], _RING["g"]
+
+
+def _c_inverse(c):
+    """c^{-1} in Z_q[x]/(x^N+1), cached by challenge (same c reused across sites);
+    None if c is not a unit (rare) so that signature contributes no low-rank row."""
+    key = (np.asarray(c, dtype=np.int64) % Q).tobytes()
+    if key not in _CINV:
+        dom, g = _ring()
+        cp = _Poly.from_list(list((np.asarray(c, dtype=object) % Q)[::-1]), _X, domain=dom)
+        try:
+            _CINV[key] = _invert(cp, g)
+        except _NotInvertible:
+            _CINV[key] = None
+    return _CINV[key]
 
 
 def negacyclic_deconv(c, z):
-    """Recover per-poly ``s1`` estimates from ``z`` given challenge ``c`` over Z_q.
-    ``c`` is length-256, ``z`` is ``(L, 256)``; returns ``(L, 256)`` in ``[0, Q)``."""
-    fwd, inv = _ntt_matrices()
-    q = Q
-    c = np.asarray(c, dtype=np.int64) % q
-    z = np.asarray(z, dtype=np.int64) % q
-    C = (fwd @ c) % q                                  # challenge in the NTT domain
-    Cinv = np.array([pow(int(v), q - 2, q) if v % q else 0 for v in C], dtype=np.int64)
-    Z = (z @ fwd.T) % q                                # (L, 256) responses -> NTT domain
-    S = (Z * Cinv[None, :]) % q                         # pointwise divide by c
-    return (S @ inv.T) % q                              # back to coefficient domain
+    """Recover per-poly ``s1`` estimates from ``z`` given challenge ``c`` over Z_q,
+    via the sympy ring inverse ``s1 = z * c^{-1}`` in ``Z_q[x]/(x^N+1)``.  ``c`` is
+    length-N, ``z`` is ``(L, N)``; returns ``(L, N)`` ints in ``[0, Q)``."""
+    dom, g = _ring()
+    cinv = _c_inverse(c)
+    z = np.atleast_2d(np.asarray(z, dtype=object) % Q)
+    out = np.zeros((z.shape[0], N_COEFFS), dtype=np.int64)
+    if cinv is None:
+        return out
+    for r in range(z.shape[0]):
+        s1p = (_Poly.from_list(list(z[r][::-1]), _X, domain=dom) * cinv) % g
+        for k, co in enumerate(s1p.all_coeffs()[::-1]):
+            out[r, k] = int(co) % Q
+    return out
 
 
 class MLDSAProfile(AnalysisProfile):
