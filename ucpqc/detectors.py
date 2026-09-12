@@ -24,6 +24,14 @@ __all__ = [
     "band_count", "band_levene",
 ]
 
+# -- detector tuning knobs (named in one place; none are scheme-specific) ---
+# Verdict thresholds (accuracy/score cutoffs that decide leak/ok) live with the
+# engine in ucpqc.assess; these are detector-internal defaults.
+TVLA_T = 4.5           # classic per-coordinate TVLA |t| flag (informational count)
+LDA_SHRINK = 0.1       # default within-key covariance shrinkage (lda_accuracy)
+UNIFORM_BINS = 64      # default histogram bins (uniformity_divergence)
+PERM_SEED = 0          # default RNG seed for the permutation-based detectors
+
 
 # --------------------------------------------------------------------------
 # feature extraction
@@ -99,13 +107,15 @@ def tvla_max(F0, F1):
     all D dims), this asks "does ANY single output position separate the keys?"
     -- catching a secret coefficient exposed at a fixed byte.  The caller applies
     a multiple-comparison-corrected threshold (D coordinates were tested).
-    Returns ``(max_abs_t, n_over_4p5)``."""
+    Returns ``(max_abs_t, n_over)`` where n_over counts coordinates past the
+    classic ``TVLA_T`` flag (informational; the verdict uses the corrected
+    threshold)."""
     at = np.abs(tvla_t(F0, F1))
     return (float(np.nanmax(at)) if at.size else 0.0,
-            int(np.sum(at > 4.5)))
+            int(np.sum(at > TVLA_T)))
 
 
-def lda_accuracy(F0, F1, shrink=0.1):
+def lda_accuracy(F0, F1, shrink=LDA_SHRINK):
     """Detector B -- covariance-aware (structural) separability.
 
     The generalization of :func:`two_key_accuracy`: whiten both populations by
@@ -243,7 +253,8 @@ def structural_leak(F0, F1, field):
     per-signature ``s1`` estimate over Z_q).  A genuine leak makes each key's rows
     collapse to a low-dimensional subspace over ``field`` and makes the two keys'
     subspaces *differ* -- the structure accumulation attacks reveal and solve.
-    Returns ``(score in [0,1], is_leak)``::
+    Returns the score in ``[0, 1]`` (the engine applies the leak threshold, like
+    the other metric detectors)::
 
         collapse   = 1 - max(rank F0, rank F1) / full   # each key in few dims
         separation = (rank[F0;F1] - max) / min(rank)    # subspaces are key-specific
@@ -260,11 +271,7 @@ def structural_leak(F0, F1, field):
     rAB = field.rank(np.vstack([F0, F1]))
     collapse = 1.0 - max(rA, rB) / max(full, 1)
     separation = (rAB - max(rA, rB)) / max(min(rA, rB), 1)
-    score = max(0.0, collapse) * max(0.0, separation)
-    return float(score), score >= STRUCTURAL_THRESHOLD
-
-
-STRUCTURAL_THRESHOLD = 0.5                    # score below which no structural leak
+    return max(0.0, collapse) * max(0.0, separation)
 
 
 def perm_pvalue(F0, F1, n_perm=2000, rng=None):
@@ -272,7 +279,7 @@ def perm_pvalue(F0, F1, n_perm=2000, rng=None):
     random key-label shuffle reach the observed separability.  Returns
     ``(observed_accuracy, p)``.  p at the 1/(n_perm+1) floor means chance never
     matched the real labels."""
-    rng = np.random.default_rng(0) if rng is None else rng
+    rng = np.random.default_rng(PERM_SEED) if rng is None else rng
     obs = two_key_accuracy(F0, F1)
     X = np.vstack([np.asarray(F0, float), np.asarray(F1, float)])
     n = len(F0)
@@ -288,7 +295,7 @@ def mmd_test(A, B, n_perm=1000, rng=None):
     """Kernel two-sample MMD^2 with a Gaussian (median-bandwidth) kernel and a
     permutation-calibrated p-value.  Model-agnostic 'are these two point clouds
     different' test; returns ``(observed_mmd2, null_samples, p)``."""
-    rng = np.random.default_rng(0) if rng is None else rng
+    rng = np.random.default_rng(PERM_SEED) if rng is None else rng
     A, B = np.asarray(A, float), np.asarray(B, float)
     Z = np.vstack([A, B])
     n0, tot = len(A), len(Z)
@@ -311,7 +318,7 @@ def mmd_test(A, B, n_perm=1000, rng=None):
 # --------------------------------------------------------------------------
 # uniformity / bias test -- for a nonce that must be uniform (y)
 # --------------------------------------------------------------------------
-def uniformity_divergence(samples, lo, hi, bins=64, ref_counts=None):
+def uniformity_divergence(samples, lo, hi, bins=UNIFORM_BINS, ref_counts=None):
     """Chi-square divergence of a coefficient distribution from uniform (or from
     a supplied golden reference histogram ``ref_counts``) over ``[lo, hi)``.
 

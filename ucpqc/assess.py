@@ -23,9 +23,9 @@ from .faults import SKIP, FaultSpec, Injector
 from .machine import EmulationError
 from .replay import Recorder, skip_sweep
 
-LEAK_THRESHOLD = 0.80
-CHANCE = 0.50
+LEAK_THRESHOLD = 0.80                  # two_key / subspace accuracy -> leak
 UNIFORMITY_SPIKE = 0.10                # bin share above which a nonce looks biased
+STRUCTURAL_THRESHOLD = 0.50            # structural_leak score -> leak
 DEFAULT_KEYS = (b"secret-key-AAAA", b"secret-key-BBBB")
 DEFAULT_N = 24
 CAP = 20_000_000
@@ -100,7 +100,8 @@ def _detector_metric(name, feats, profile):
     if name == "structural":                  # detector B*: field-aware structural
         if profile.field is None or len(A) < 3 or len(B) < 3:
             return None, False
-        return detectors.structural_leak(A, B, profile.field)
+        score = detectors.structural_leak(A, B, profile.field)
+        return score, score >= STRUCTURAL_THRESHOLD
     if name == "per_coord":                   # detector A: per-coordinate max|t|
         if len(A) < 3 or len(B) < 3:
             return None, False

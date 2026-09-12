@@ -35,7 +35,7 @@ class MayoProfile(AnalysisProfile):
     patterns = ("mayo*",)
     op = "sign"
     artifact_len = 0                         # variant-agnostic: skip the length check
-    field = GF2m(4)                          # MAYO arithmetic is over GF(16)
+    field = GF2m(4, poly=0x13)               # MAYO's GF(16) = GF(2^4) mod x^4+x+1
 
     # sweep sites are auto-discovered by the base AnalysisProfile.fault_sites,
     # which descends the crypto_sign_signature wrapper into mayo_sign_signature.
