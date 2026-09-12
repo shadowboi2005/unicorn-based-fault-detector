@@ -650,6 +650,38 @@ def test_detect_reuses_dump():
         pass
 
 
+def test_parallel_sweep_matches_serial():
+    """The multiprocessing sweep is bit-identical to the serial one (same
+    deterministic inputs, same per-site seam), verified on a small subset."""
+    from ucpqc import assess, parallel
+    from ucpqc.profiles import profile_for
+    m, scheme = booted(seed=b"ucpqc")
+    m.stub_cycle_counter()                        # match the CLI/parallel machine setup
+    prof = profile_for(scheme)
+    prof.setup(m)
+    op = scheme.binding.symbols["signature"]
+    addrs = {a for a, _ in prof.fault_sites(m, op)}
+    assert 0x4d5e in addrs, "the z=z+y mask add is discovered"
+    subset = {0x4d5e}                             # the leak site (fast; runs cleanly)
+    sites = [(a, lbl) for a, lbl in prof.fault_sites(m, op) if a in subset]
+    n = 4
+    orig = type(prof).fault_sites                 # serial reference over the subset
+    type(prof).fault_sites = lambda self, mm, of: sites
+    try:
+        serial = assess.sweep_sites(scheme, prof, n=n)
+    finally:
+        type(prof).fault_sites = orig
+    par = parallel.sweep_sites_parallel(DILITHIUM, "mps2-an386", n=n, jobs=2,
+                                        site_filter=subset)
+    show = lambda r: (r.addr, r.label, r.status, r.metric, r.ran, r.crashed)
+    sd = {r.addr: r for r in serial.rows}
+    pd = {r.addr: r for r in par.rows}
+    assert set(sd) == set(pd), "same rows in both"
+    for a in sd:
+        assert show(sd[a]) == show(pd[a]), f"row mismatch at {a!r}"
+    assert any(r.status == "LEAK" for r in par.rows), "0x4d5e still flags LEAK"
+
+
 # --- runner -----------------------------------------------------------------
 
 
