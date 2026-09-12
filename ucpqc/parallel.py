@@ -111,8 +111,10 @@ def _worker_init(cfg):
     the deterministic inputs (keys, messages, site labels)."""
     m, scheme, profile = _build_bound_machine(cfg.elf_path, cfg.platform_name,
                                               cfg.seed, cfg.profile_override)
-    profile.setup(m)
+    # same order as assess.sweep_sites (keys then setup) so the clean state each
+    # site is isolated to is byte-identical to the serial engine's
     sk = {k: _assess._keypair(scheme, s)[1] for k, s in zip("AB", cfg.keys)}
+    profile.setup(m)
     sites = dict(profile.fault_sites(m, _op_func(scheme)))
     if cfg.site_filter is not None:
         sites = {a: sites[a] for a in cfg.site_filter if a in sites}
