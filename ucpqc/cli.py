@@ -272,7 +272,16 @@ def _emit(args, result):
 
 def cmd_sweep(args):
     """Whole-call fault sweep over the operation's inner loop (ALAFA-style)."""
-    m, scheme = _machine(args)
+    if args.jobs != 1:                            # parallel (multiprocessing) path
+        from . import parallel
+        result = parallel.sweep_sites_parallel(
+            args.elf, platform_name=args.platform, n=args.n,
+            detector=args.detector, jobs=args.jobs, seed=args.seed.encode(),
+            profile_override=getattr(args, "profile", None),
+            calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
+            fdr_q=args.fdr, correction=args.correction)
+        return _emit(args, result)
+    m, scheme = _machine(args)                    # serial reference path
     profile = _profile(args, scheme)
     result = assessmod.sweep_sites(scheme, profile, n=args.n, detector=args.detector,
                                    calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
@@ -502,6 +511,8 @@ def build_parser():
                    help="also write the golden + faulty runs (artifact + challenge per "
                         "item) as JSON to DIR (default 'dump'), for offline replay with "
                         "`ucpqc detect` -- no re-emulation")
+    p.add_argument("-j", "--jobs", type=int, default=1,
+                   help="parallel worker processes (1=serial, 0=auto/all CPUs)")
     _add_calibration_flags(p)
     p.set_defaults(handler=cmd_sweep)
 
