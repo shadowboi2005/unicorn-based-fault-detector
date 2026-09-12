@@ -116,11 +116,13 @@ def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
     """Sweep every fault site from `profile.fault_sites`, re-running the
     operation with a persistent whole-call skip and scoring the two-key leak of
     the released artifacts.  Returns an `AssessmentResult`."""
+    from .scheme import SIGN
     m = scheme.machine
     sk = {k: _keypair(scheme, seed)[1] for k, seed in zip("AB", keys)}
     profile.setup(m)
     messages = standard_messages(n)
-    sites = [(None, "no fault (control)")] + list(profile.fault_sites(m))
+    op_func = scheme.binding.symbols["signature" if scheme.kind == SIGN else "dec"]
+    sites = [(None, "no fault (control)")] + list(profile.fault_sites(m, op_func))
 
     def collect(site):
         feats = {"A": [], "B": []}

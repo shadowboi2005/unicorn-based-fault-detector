@@ -25,10 +25,9 @@ left as future work.  Fully running/profiling/faulting MAYO needs none of this
 
 import numpy as np
 
-from . import AnalysisProfile, discover_call_sites, register
+from . import AnalysisProfile, register
 
 # MAYO-1 sizes (pk, sk, sig) = (1420, 24, 454); other variants differ.
-SIGN_FUNC = "mayo_sign_signature"
 
 
 class MayoProfile(AnalysisProfile):
@@ -36,9 +35,8 @@ class MayoProfile(AnalysisProfile):
     op = "sign"
     artifact_len = 0                         # variant-agnostic: skip the length check
 
-    def fault_sites(self, machine):
-        """Every internal call in `mayo_sign_signature`, found by disassembly."""
-        return discover_call_sites(machine, SIGN_FUNC)
+    # sweep sites are auto-discovered by the base AnalysisProfile.fault_sites,
+    # which descends the crypto_sign_signature wrapper into mayo_sign_signature.
 
     def challenge(self, machine, artifact):
         return None                          # MAYO has no challenge context

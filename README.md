@@ -60,9 +60,10 @@ python -m ucpqc schemes   dilithium         # what is available in the pqm4 tree
 
 `sweep` and `funcskip` are the two **fault-leakage assessment modes** — they ask
 whether a *fault* makes the output leak the secret key (no side-channel traces
-are involved).  `sweep` skips each whole operation call in the signing loop and
-runs a two-key test on the released signatures (only `z = z + y` leaks, at 100%).
-`funcskip` skips every
+are involved).  `sweep` skips each whole operation call in the signing loop —
+its sites are **auto-discovered** by disassembling the resolved signing function
+(no per-firmware address table) — and runs a two-key test on the released
+signatures (only `z = z + y` leaks, at 100%).  `funcskip` skips every
 instruction *inside* one function by capturing its I/O once and replaying just
 that function per trial (~240x cheaper than re-signing).  Both auto-select an
 **analysis profile** from the scheme (`--profile` to override, `--detector` to

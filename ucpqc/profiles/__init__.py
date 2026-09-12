@@ -27,7 +27,7 @@ The profile is selected automatically from `scheme.name` via `profile_for`.
 import fnmatch
 
 __all__ = ["AnalysisProfile", "register", "profile_for", "profiles",
-           "discover_call_sites"]
+           "discover_call_sites", "signing_body"]
 
 
 class AnalysisProfile:
@@ -54,11 +54,16 @@ class AnalysisProfile:
         per-iteration `scratch_reset`).  Default: nothing."""
 
     # -- sweep-site enumeration ---------------------------------------------
-    def fault_sites(self, machine):
+    def fault_sites(self, machine, op_func):
         """Return `[(addr, label), ...]` -- the whole-call sweep sites in the
-        operation's inner loop (hard-coded per firmware, or discovered from the
-        machine's disassembly via :func:`discover_call_sites`)."""
-        raise NotImplementedError
+        operation's inner loop.
+
+        Default: auto-discover them by disassembling the operation's body,
+        descending through thin wrappers (:func:`signing_body`) to the function
+        that holds the loop.  `op_func` is the resolved operation entry symbol
+        (the engine passes `scheme.binding.symbols['signature'|'dec']`).  Override
+        only if a scheme needs curated/filtered sites."""
+        return discover_call_sites(machine, signing_body(machine, op_func))
 
     # -- feature extraction (shared by both modes) --------------------------
     def challenge(self, machine, artifact):
@@ -90,24 +95,53 @@ class AnalysisProfile:
 
 
 # --- helpers ---------------------------------------------------------------
+def _scan_calls(machine, func):
+    """Every `bl`/`blx` in `func`'s body as `[(addr, target, label)]`.  `target`
+    is the branch destination address (from a `#imm` operand) or None for a
+    register-indirect call; `label` is `bl <symbol>` when the target resolves."""
+    start, end = machine.image.extent_of(func)
+    calls, pc = [], start
+    while pc < end:
+        addr, size, text = machine.disasm_one(pc)
+        if text.startswith("bl ") or text.startswith("blx "):
+            target, label = None, text
+            if "#" in text:
+                try:
+                    target = int(text.split("#")[-1], 16)
+                    label = f"bl {machine.image.describe(target)}"
+                except ValueError:
+                    pass
+            calls.append((addr, target, label))
+        pc += size or 2
+    return calls
+
+
 def discover_call_sites(machine, func):
     """Every `bl`/`blx` inside `func`'s body as `[(addr, label)]`, labelling the
     callee by symbol -- a firmware-agnostic alternative to a hard-coded site
     table (`fault_sites` can just return this)."""
-    start, end = machine.image.extent_of(func)
-    sites, pc = [], start
-    while pc < end:
-        addr, size, text = machine.disasm_one(pc)
-        if text.startswith("bl ") or text.startswith("blx "):
-            label = text
-            if "#" in text:
-                try:
-                    label = f"bl {machine.image.describe(int(text.split('#')[-1], 16))}"
-                except ValueError:
-                    pass
-            sites.append((addr, label))
-        pc += size or 2
-    return sites
+    return [(addr, label) for addr, _, label in _scan_calls(machine, func)]
+
+
+def signing_body(machine, func, max_depth=4):
+    """Descend from `func` through thin wrappers to the function that holds the
+    operation loop.  A wrapper is a body whose only internal-function call is a
+    tail-call to another function's start (e.g. MAYO's `crypto_sign_signature`
+    -> `mayo_sign_signature`); descend into it.  A body with many calls (e.g.
+    Dilithium's inline reject loop) is returned as-is."""
+    for _ in range(max_depth):
+        callees = []
+        for _addr, target, _label in _scan_calls(machine, func):
+            if target is None:
+                continue
+            fn = machine.image.func_at(target)
+            if fn is not None and fn.addr == target:      # a call to a function start
+                callees.append(fn.name)
+        distinct = set(callees)
+        if len(distinct) != 1:                            # not a thin wrapper -> the body
+            return func
+        func = distinct.pop()                             # descend into the sole callee
+    return func
 
 
 # --- registry --------------------------------------------------------------

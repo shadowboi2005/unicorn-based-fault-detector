@@ -332,11 +332,14 @@ def test_scratch_mark_reset():
 def test_profile_auto_selection():
     from ucpqc.profiles import profile_for
     from ucpqc.profiles.mldsa import MLDSAProfile, SIGLEN
-    _, scheme = booted()
+    m, scheme = booted()
     prof = profile_for(scheme)
     assert isinstance(prof, MLDSAProfile), "ml-dsa ELF selects the ML-DSA profile"
     assert SIGLEN == 2420
-    assert len(prof.fault_sites(None)) == 20
+    op = scheme.binding.symbols["signature"]
+    addrs = {a for a, _ in prof.fault_sites(m, op)}     # auto-discovered
+    assert 0x4d5e in addrs, "the z=z+y mask add is discovered"
+    assert len(addrs) > 20, "discovery is a superset of the old curated table"
     assert prof.detector_for(prof.default_target()) == "two_key"
 
 
@@ -374,7 +377,8 @@ def test_mayo_runs_and_selects_profile():
     assert scheme.name.startswith("mayo"), "a multivariate scheme, detected generically"
     prof = profile_for(scheme)
     assert isinstance(prof, MayoProfile)
-    assert len(prof.fault_sites(m)) > 5, "sweep sites discovered by disassembly"
+    op = scheme.binding.symbols["signature"]
+    assert len(prof.fault_sites(m, op)) > 5, "sweep sites discovered by disassembly"
     pk, sk = scheme.keypair()                # runs end to end via the general core
     assert scheme.verify(scheme.sign(b"hi", sk), b"hi", pk)
 

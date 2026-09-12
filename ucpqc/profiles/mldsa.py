@@ -30,29 +30,6 @@ SIGLEN = CTILDE_BYTES + POLYZ_BYTES * L + 84
 POLYVECL_BYTES = L * N_COEFFS * 4
 R0_BOUND = GAMMA2 - BETA                     # gamma2 - beta, the r0 reject bound
 
-# -- signing-loop fault sites (specific to firmware/ml-dsa-44_m4f_test.elf) --
-# One (bl address, label) per operation call in the reject-and-retry loop.
-SIGNING_SITES = [
-    (0x4c7c, "sample y (uniform_gamma1)"), (0x4c90, "memcpy"),
-    (0x4c9a, "y -> NTT (polyvecl_ntt)"), (0x4cb0, "w = A*y (matrix_pointwise)"),
-    (0x4cc4, "w -> invNTT"), (0x4ce0, "decompose w"), (0x4cec, "pack w1"),
-    (0x4d18, "shake squeeze (c_tilde)"), (0x4d22, "poly_challenge (c)"),
-    (0x4d4c, "c*s1 (basemul_invntt)"), (0x4d5e, "z = z + y (polyvecl_add)"),
-    (0x4d68, "reduce z"), (0x4d74, "z-norm check (chknorm)"),
-    (0x4d88, "pack z into sig"), (0x4dbc, "c*s2 (basemul_invntt)"),
-    (0x4dca, "w0 - c*s2 (poly_sub)"), (0x4dd8, "r0 check (chknorm)"),
-    (0x4dec, "c*t0 (pointwise)"), (0x4e0e, "ct0 check (chknorm)"),
-    (0x4e32, "make_hint"),
-]
-# Named singles used by the intra-function / rejection-region demos.
-MASK_ADD = 0x4d5e        # bl polyvecl_add, z = z + y (the mask add)
-R0_CHKNORM = 0x4dd8      # bl poly_chknorm for the r0 check
-R0_CMP = 0x4ddc          # cmp r0,#0 after it
-R0_BRANCH = 0x4dde       # bne to reject -- the load-bearing rejection branch
-R0_ACCEPT = 0x4de0       # fall-through accept path
-R0_REJECT = 0x4e86       # reject / restart target
-
-
 class MLDSAProfile(AnalysisProfile):
     patterns = ("ml-dsa-*", "dilithium*")
     op = "sign"
@@ -65,9 +42,8 @@ class MLDSAProfile(AnalysisProfile):
         if self._cbuf is None:
             self._cbuf = machine.alloc(4 * N_COEFFS)
 
-    # -- sweep sites --------------------------------------------------------
-    def fault_sites(self, machine):
-        return list(SIGNING_SITES)          # hard-coded for this firmware build
+    # sweep sites are auto-discovered by the base AnalysisProfile.fault_sites
+    # (disassembly of the signing function) -- no hard-coded address table.
 
     # -- feature extraction -------------------------------------------------
     def challenge(self, machine, artifact):
