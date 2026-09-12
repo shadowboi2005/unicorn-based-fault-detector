@@ -111,22 +111,18 @@ def _status(metric, is_leak, ran, crashed, control=False):
 # --------------------------------------------------------------------------
 # mode "sweep" -- whole-call skips over the operation loop
 # --------------------------------------------------------------------------
-def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
-                detector="two_key", budget=CAP, progress=None):
-    """Sweep every fault site from `profile.fault_sites`, re-running the
-    operation with a persistent whole-call skip and scoring the two-key leak of
-    the released artifacts.  Returns an `AssessmentResult`."""
-    from .scheme import SIGN
-    m = scheme.machine
-    sk = {k: _keypair(scheme, seed)[1] for k, seed in zip("AB", keys)}
-    profile.setup(m)
-    messages = standard_messages(n)
-    op_func = scheme.binding.symbols["signature" if scheme.kind == SIGN else "dec"]
-    sites = [(None, "no fault (control)")] + list(profile.fault_sites(m, op_func))
+def _run_site(scheme, profile, sk, messages, site, label, detector, budget):
+    """Run ONE sweep site (whole-call skip) and return its `SiteResult`.
 
-    def collect(site):
-        feats = {"A": [], "B": []}
-        crashed = 0
+    Pure and deterministic given its arguments, so the serial `sweep_sites` and
+    the parallel backends share it and produce identical rows.  `site` is an int
+    address, or None for the control row.  This is the reusable, machine-in-arg
+    seam the parallel executors hook into (`scheme.machine` is the live engine)."""
+    m = scheme.machine
+    feats = {"A": [], "B": []}
+    crashed = 0
+    unstable = False
+    try:
         for key in "AB":
             m.stub_randombytes(f"nonce-{key}".encode())
             mark = m.scratch_mark()
@@ -143,28 +139,42 @@ def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
                         crashed += 1
                         raise _Unstable
                     c = profile.challenge(m, art)
-                    feats[key].append(profile.feature(c, profile.response_from_signature(art)))
+                    feats[key].append(
+                        profile.feature(c, profile.response_from_signature(art)))
             except _Unstable:
-                return feats, crashed, True
+                unstable = True
+                break
             finally:
                 if inj:
                     inj.detach()
-        return feats, crashed, False
+    except EmulationError:                       # matches the serial outer guard
+        feats, crashed, unstable = {"A": [], "B": []}, len(messages), True
+    ran = len(feats["A"]) + len(feats["B"])
+    if unstable:
+        metric, is_leak = None, False
+    else:
+        metric, is_leak = _detector_metric(detector, feats, profile)
+    status = _status(metric, is_leak, min(len(feats["A"]), len(feats["B"])),
+                     crashed, control=(site is None))
+    return SiteResult(site, label, metric, status, ran, crashed)
+
+
+def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
+                detector="two_key", budget=CAP, progress=None):
+    """Sweep every fault site from `profile.fault_sites`, re-running the
+    operation with a persistent whole-call skip and scoring the two-key leak of
+    the released artifacts.  Returns an `AssessmentResult`."""
+    from .scheme import SIGN
+    m = scheme.machine
+    sk = {k: _keypair(scheme, seed)[1] for k, seed in zip("AB", keys)}
+    profile.setup(m)
+    messages = standard_messages(n)
+    op_func = scheme.binding.symbols["signature" if scheme.kind == SIGN else "dec"]
+    sites = [(None, "no fault (control)")] + list(profile.fault_sites(m, op_func))
 
     rows = []
     for site, label in sites:
-        try:
-            feats, crashed, unstable = collect(site)
-        except EmulationError:
-            feats, crashed, unstable = {"A": [], "B": []}, n, True
-        ran = len(feats["A"]) + len(feats["B"])
-        if unstable:
-            metric, is_leak = None, False
-        else:
-            metric, is_leak = _detector_metric(detector, feats, profile)
-        status = _status(metric, is_leak, min(len(feats["A"]), len(feats["B"])),
-                         crashed, control=(site is None))
-        row = SiteResult(site, label, metric, status, ran, crashed)
+        row = _run_site(scheme, profile, sk, messages, site, label, detector, budget)
         rows.append(row)
         if progress:
             progress(row)
@@ -174,15 +184,13 @@ def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
 # --------------------------------------------------------------------------
 # mode "funcskip" -- instruction skips inside one function (capture-replay)
 # --------------------------------------------------------------------------
-def sweep_function(scheme, profile, target=None, keys=DEFAULT_KEYS, n=DEFAULT_N,
-                   detector=None, backend="call", budget=5_000_000, progress=None):
-    """Capture one function's I/O across N signings per key, then replay it under
-    an instruction skip at every interior site and score the leak.  `target` is a
-    `replay.Target` (defaults to `profile.default_target()`).  Returns an
-    `AssessmentResult`."""
+def _capture_funcskip(scheme, profile, target, backend, keys, n):
+    """Capture the target's I/O across N signings per key -> {key: [Capture]}.
+
+    The expensive funcskip prelude (2*N full signings).  Factored out so a
+    parallel driver can capture once on the coordinator and ship the (pure-data,
+    for the call backend) captures to workers.  Shared by the serial path."""
     m = scheme.machine
-    target = target or profile.default_target()
-    detector = detector or profile.detector_for(target)
     sk = {k: _keypair(scheme, seed)[1] for k, seed in zip("AB", keys)}
     profile.setup(m)
     messages = standard_messages(n)
@@ -203,17 +211,39 @@ def sweep_function(scheme, profile, target=None, keys=DEFAULT_KEYS, n=DEFAULT_N,
         rec.detach()
         return caps
 
-    caps_by_key = {k: capture(k) for k in ("A", "B")}
+    return {k: capture(k) for k in ("A", "B")}
 
+
+def _make_featurize(profile, detector):
+    """Build the funcskip featurizer (shared by serial + parallel)."""
     def featurize(cap, out):
         resp = profile.response_from_output(out)
         if detector == "two_key":
             return profile.feature(cap.c, resp)
         return resp.ravel()                            # uniformity / spec_aware
+    return featurize
 
+
+def _make_detect(profile, detector):
+    """Build the funcskip detector (shared by serial + parallel)."""
     def detect(feats):
         metric, is_leak = _detector_metric(detector, feats, profile)
         return {"metric": metric, "leak": is_leak}
+    return detect
+
+
+def sweep_function(scheme, profile, target=None, keys=DEFAULT_KEYS, n=DEFAULT_N,
+                   detector=None, backend="call", budget=5_000_000, progress=None):
+    """Capture one function's I/O across N signings per key, then replay it under
+    an instruction skip at every interior site and score the leak.  `target` is a
+    `replay.Target` (defaults to `profile.default_target()`).  Returns an
+    `AssessmentResult`."""
+    m = scheme.machine
+    target = target or profile.default_target()
+    detector = detector or profile.detector_for(target)
+    caps_by_key = _capture_funcskip(scheme, profile, target, backend, keys, n)
+    featurize = _make_featurize(profile, detector)
+    detect = _make_detect(profile, detector)
 
     swept = skip_sweep(m, target, caps_by_key, featurize, detect,
                        backend=backend, persistent=True, budget=budget)

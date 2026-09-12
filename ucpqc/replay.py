@@ -299,6 +299,33 @@ def _skip_sites(machine, target, stride=1, persistent=False):
             index += 1
 
 
+def _replay_site(machine, target, spec, captures_by_key, featurize, detect,
+                 backend, budget):
+    """Replay every capture under one skip `spec`, featurize the survivors, and
+    score the populations -> one row dict {'pc','text','crashed','ran',**detect}.
+
+    The reusable per-site seam of `skip_sweep`; deterministic given the captures,
+    so a parallel driver can call it against a shipped `captures_by_key`."""
+    keys = list(captures_by_key)
+    _, _, text = machine.disasm_one(spec.pc)
+    feats = {k: [] for k in keys}
+    crashed = ran = 0
+    for k in keys:
+        for cap in captures_by_key[k]:
+            out = replay(machine, target, cap, spec, backend, budget)
+            if out is None:
+                crashed += 1
+            else:
+                ran += 1
+                feats[k].append(featurize(cap, out))
+    row = {"pc": spec.pc, "text": text, "crashed": crashed, "ran": ran}
+    try:
+        row.update(detect(feats))
+    except Exception as exc:             # too few survivors, etc.
+        row["error"] = str(exc)
+    return row
+
+
 def skip_sweep(machine, target, captures_by_key, featurize, detect,
                backend="snapshot", stride=1, persistent=False,
                budget=5_000_000, progress=None):
@@ -311,7 +338,6 @@ def skip_sweep(machine, target, captures_by_key, featurize, detect,
     `detect(features_by_key) -> dict`         (e.g. {'acc': two_key_accuracy(...)})
     Returns per-site dicts: {'pc', 'text', 'crashed', 'ran', **detect_result}.
     """
-    keys = list(captures_by_key)
     results = []
     # sandbox: a wild persistent skip can make an isolated replay run away and
     # scribble over shared memory; snapshot here and restore at the end so the
@@ -319,22 +345,8 @@ def skip_sweep(machine, target, captures_by_key, featurize, detect,
     guard = machine.snapshot()
     try:
         for spec in _skip_sites(machine, target, stride, persistent):
-            _, _, text = machine.disasm_one(spec.pc)
-            feats = {k: [] for k in keys}
-            crashed = ran = 0
-            for k in keys:
-                for cap in captures_by_key[k]:
-                    out = replay(machine, target, cap, spec, backend, budget)
-                    if out is None:
-                        crashed += 1
-                    else:
-                        ran += 1
-                        feats[k].append(featurize(cap, out))
-            row = {"pc": spec.pc, "text": text, "crashed": crashed, "ran": ran}
-            try:
-                row.update(detect(feats))
-            except Exception as exc:             # too few survivors, etc.
-                row["error"] = str(exc)
+            row = _replay_site(machine, target, spec, captures_by_key,
+                               featurize, detect, backend, budget)
             results.append(row)
             if progress:
                 progress(row)
