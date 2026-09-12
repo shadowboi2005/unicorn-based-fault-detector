@@ -117,8 +117,17 @@ def _run_site(scheme, profile, sk, messages, site, label, detector, budget):
     Pure and deterministic given its arguments, so the serial `sweep_sites` and
     the parallel backends share it and produce identical rows.  `site` is an int
     address, or None for the control row.  This is the reusable, machine-in-arg
-    seam the parallel executors hook into (`scheme.machine` is the live engine)."""
+    seam the parallel executors hook into (`scheme.machine` is the live engine).
+
+    Sites must be independent: a faulted/hung signing leaves the guest machine
+    dirty, so without isolation the next site inherits that state and its verdict
+    depends on which site ran before it -- reproducible in a fixed serial order,
+    but non-deterministic once a pool schedules sites across workers.  We snapshot
+    on entry and restore on exit so every site starts from identical clean state;
+    this makes the serial and both parallel backends agree exactly and removes the
+    spurious near-threshold "leaks" small-N sweeps used to show."""
     m = scheme.machine
+    guard = m.snapshot()                         # leave the machine as we found it
     feats = {"A": [], "B": []}
     crashed = 0
     unstable = False
@@ -149,6 +158,8 @@ def _run_site(scheme, profile, sk, messages, site, label, detector, budget):
                     inj.detach()
     except EmulationError:                       # matches the serial outer guard
         feats, crashed, unstable = {"A": [], "B": []}, len(messages), True
+    finally:
+        m.restore(guard)                         # isolate the next site from this one
     ran = len(feats["A"]) + len(feats["B"])
     if unstable:
         metric, is_leak = None, False
