@@ -1,7 +1,7 @@
-"""ucpqc - a Unicorn-based emulation framework for post-quantum crypto firmware.
+"""ucpqc - a Unicorn-based fault-analysis platform for post-quantum crypto firmware.
 
 Built for CRYSTALS-Dilithium (ML-DSA) on Cortex-M4, but the emulator, the
-tracers, the fault injector and the leakage models are scheme-agnostic: only
+tracers, the fault injector and the analysis engine are scheme-agnostic: only
 :mod:`ucpqc.scheme` knows what a signature or a KEM is, and it discovers that
 from the ELF.
 
@@ -33,16 +33,6 @@ from .faults import (
     sweep_memory_bits,
     sweep_register_bits,
 )
-from .leakage import (
-    HD_MEM,
-    HD_REG,
-    HW_MEM,
-    HW_REG,
-    LeakageTracer,
-    TraceSet,
-    hamming_distance,
-    hamming_weight,
-)
 from .machine import EmulationError, Machine
 from .platform import MPS2_AN386, PLATFORMS, Platform, Region
 from .scheme import KEM, SIGN, Scheme, SchemeError, detect
@@ -68,14 +58,9 @@ __all__ = [
     "FLIP_FLAGS",
     "FaultCampaign",
     "FaultSpec",
-    "HD_MEM",
-    "HD_REG",
-    "HW_MEM",
-    "HW_REG",
     "Injector",
     "InstructionTracer",
     "KEM",
-    "LeakageTracer",
     "MPS2_AN386",
     "Machine",
     "MemoryTracer",
@@ -91,15 +76,12 @@ __all__ = [
     "Scheme",
     "SchemeError",
     "Symbol",
-    "TraceSet",
     "TrialResult",
     "Trigger",
     "assess",
     "detect",
     "profiles",
     "report",
-    "hamming_distance",
-    "hamming_weight",
     "sweep_function_body",
     "sweep_hits",
     "sweep_instructions",

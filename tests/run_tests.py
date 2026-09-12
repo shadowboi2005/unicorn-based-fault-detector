@@ -19,13 +19,10 @@ from ucpqc import (  # noqa: E402
     FaultCampaign,
     FaultSpec,
     InstructionTracer,
-    LeakageTracer,
     Machine,
     Outcome,
     Profiler,
     Scheme,
-    hamming_distance,
-    hamming_weight,
 )
 from ucpqc.elfimage import ElfImage  # noqa: E402
 from ucpqc.faults import Injector, sweep_function_body  # noqa: E402
@@ -297,37 +294,6 @@ def test_campaign_classifies_and_restores():
 
 
 # --- leakage ----------------------------------------------------------------
-
-
-def test_hamming_helpers():
-    assert hamming_weight(0) == 0
-    assert hamming_weight(0xFFFFFFFF) == 32
-    assert hamming_weight(0x1FF, width=8) == 8
-    assert hamming_distance(0xF0, 0x0F) == 8
-
-
-def test_leakage_trace_is_aligned_across_calls():
-    m, _ = booted()
-    buf = m.alloc(1024)
-    tracer = LeakageTracer(m, model="hd_reg", window="pqcrystals_dilithium_ntt", scope="body")
-    lengths = []
-    mark = 0
-    for i in range(3):
-        m.write(buf, struct.pack("<256i", *([i * 7 + 1] * 256)))
-        m.call("pqcrystals_dilithium_ntt", [buf])
-        lengths.append(len(tracer.samples) - mark)
-        mark = len(tracer.samples)
-    assert len(set(lengths)) == 1, f"traces of unequal length: {lengths}"
-    assert all(0 <= s <= 13 * 32 for s in tracer.samples)
-
-
-def test_memory_leakage_model():
-    m, _ = booted()
-    buf = m.alloc(1024)
-    tracer = LeakageTracer(m, model="hw_mem", mem_range=(buf, buf + 1023))
-    m.write(buf, struct.pack("<256i", *range(256)))
-    m.call("pqcrystals_dilithium_ntt", [buf])
-    assert len(tracer) > 100
 
 
 # --- build helpers ----------------------------------------------------------

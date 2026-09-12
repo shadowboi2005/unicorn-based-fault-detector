@@ -11,8 +11,6 @@ from . import firmware as fw
 from . import profiles as profilemod
 from . import report as reportmod
 from .elfimage import ElfImage
-from .leakage import MODELS as LEAK_MODELS
-from .leakage import LeakageTracer
 from .machine import EmulationError, Machine
 from .platform import PLATFORMS
 from .scheme import SIGN, Scheme
@@ -257,22 +255,6 @@ def cmd_fault(args):
     return 0
 
 
-def cmd_leak(args):
-    m, scheme = _machine(args)
-    func = _resolve_func(scheme, args.func) if args.func else None
-    op, label = _operation(scheme, args.op, args.message.encode())
-    tracer = LeakageTracer(
-        m, model=args.model, window=func, limit=args.limit, scope=args.scope
-    )
-    started = time.time()
-    op(m)
-    print(f"{label} traced in {time.time() - started:.2f}s")
-    print(tracer.summary())
-    if args.out:
-        print("written to", tracer.save(args.out, noise=args.noise))
-    return 0
-
-
 def _profile(args, scheme):
     return profilemod.profile_for(scheme, override=getattr(args, "profile", None))
 
@@ -422,22 +404,6 @@ def build_parser():
         help="do not verify the faulty output (faster, fewer classifications)",
     )
     p.set_defaults(handler=cmd_fault)
-
-    p = sub.add_parser("leak", help="record a simulated leakage trace")
-    add_elf(p, op_default="sign")
-    p.add_argument("--func", help="window the trace to this function")
-    p.add_argument("--model", default="hd_reg", choices=LEAK_MODELS)
-    p.add_argument("--limit", type=int, default=2_000_000)
-    p.add_argument("--noise", type=float, default=0.0)
-    p.add_argument(
-        "--scope",
-        default="call",
-        choices=("call", "body"),
-        help="call: everything run while inside --func, including callees; "
-        "body: only the function's own instructions (much faster)",
-    )
-    p.add_argument("--out", help="write the trace to .npy or .csv")
-    p.set_defaults(handler=cmd_leak)
 
     p = sub.add_parser("sweep", help="whole-call fault sweep over the signing loop "
                        "(ALAFA-style two-key leak test)")

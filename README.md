@@ -1,9 +1,10 @@
-# ucpqc — a Unicorn framework for running PQC firmware
+# ucpqc — a Unicorn-based fault-analysis platform for PQC firmware
 
 Runs **CRYSTALS-Dilithium (ML-DSA)** — and any other pqm4 scheme — on an
 emulated ARM Cortex-M4, and exposes the execution to Python: call individual
-functions with your own inputs, trace them, inject faults, and record
-simulated leakage traces.
+functions with your own inputs, trace them, and inject faults to assess whether
+the firmware leaks its secret key under a fault.  This is a fault-analysis
+platform, not a side-channel leakage simulator.
 
 The emulated board is **MPS2-AN386**, the same target the pqm4 `make` flow and
 the QEMU setup in `../QEMU-test` use, so the ELFs are byte-identical to what
@@ -32,7 +33,7 @@ verified: True   (1.40s wall)
 ```bash
 make setup          # .venv with unicorn, capstone, pyelftools, numpy
 make firmware       # builds ML-DSA-44/65, ML-KEM-768 and the ML-DSA reference
-make test           # 24 tests, ~20s
+make test           # 26 tests, ~25s
 make demo
 ```
 
@@ -50,7 +51,6 @@ python -m ucpqc roundtrip fw.elf            # keygen/sign/verify (or KEM) by dir
 python -m ucpqc profile   fw.elf --op sign --top 15
 python -m ucpqc calls     fw.elf --op keypair --depth 4
 python -m ucpqc trace     fw.elf --func ntt --scope body --csv ntt.csv
-python -m ucpqc leak      fw.elf --func ntt --model hd_reg --out ntt.npy
 python -m ucpqc fault     fw.elf --func challenge --model skip --hit 2 --csv faults.csv
 python -m ucpqc sweep     fw.elf --n 24                    # whole-call leak sweep (ALAFA)
 python -m ucpqc funcskip  fw.elf --target polyvecl_add     # intra-function skip sweep
@@ -58,9 +58,11 @@ python -m ucpqc build     crypto_kem/ml-kem-768/m4fspeed
 python -m ucpqc schemes   dilithium         # what is available in the pqm4 tree
 ```
 
-`sweep` and `funcskip` are the two **leakage-assessment modes**.  `sweep` skips
-each whole operation call in the signing loop and runs a two-key leak test on the
-released signatures (only `z = z + y` leaks, at 100%).  `funcskip` skips every
+`sweep` and `funcskip` are the two **fault-leakage assessment modes** — they ask
+whether a *fault* makes the output leak the secret key (no side-channel traces
+are involved).  `sweep` skips each whole operation call in the signing loop and
+runs a two-key test on the released signatures (only `z = z + y` leaks, at 100%).
+`funcskip` skips every
 instruction *inside* one function by capturing its I/O once and replaying just
 that function per trial (~240x cheaper than re-signing).  Both auto-select an
 **analysis profile** from the scheme (`--profile` to override, `--detector` to
@@ -102,7 +104,6 @@ transformed = struct.unpack("<256i", m.read(poly, 1024))
 | `CallTracer` | call tree with per-call instruction cost | low |
 | `InstructionTracer` | every instruction, optionally with registers | high |
 | `MemoryTracer` | every load/store in an address range | medium |
-| `LeakageTracer` | one leakage sample per instruction or access | high |
 | `FaultCampaign` | sweep of fault models, classified against a golden run | one run per trial |
 | `assess.sweep_sites` | whole-call leak sweep of the operation loop (mode `sweep`) | one op per trial |
 | `assess.sweep_function` | intra-function instruction-skip sweep via capture-replay (mode `funcskip`) | one function per trial |
@@ -128,7 +129,7 @@ costs one signing operation and nothing else.
 
 ## Running another PQC scheme
 
-The emulator, the tracers, the fault injector and the leakage models work on
+The emulator, the tracers, the fault injector and the analysis engine work on
 instructions and memory; none of them names an algorithm. Only
 `ucpqc/scheme.py` knows what a signature or a KEM is, and it discovers that
 from the ELF. For a scheme that is in pqm4, the whole change is a build:
@@ -164,9 +165,9 @@ What you *may* want to add, and where:
 | Convenient names for internals (`--func ntt`) | add an entry to `LANDMARKS` in `ucpqc/scheme.py` |
 | A different board (STM32, nRF, …) | add a `Platform` in `ucpqc/platform.py` (memory map + UART base) and model any peripheral the firmware pokes in `Peripherals` |
 | A different core (Cortex-M0/M33, RISC-V) | `Machine(..., cpu=...)` for another Cortex-M; another architecture needs the Unicorn arch/mode and the semihosting decoder in `machine.py` |
-| Leakage `sweep`/`funcskip` on a new scheme | add an **analysis profile** (below) |
+| Fault `sweep`/`funcskip` on a new scheme | add an **analysis profile** (below) |
 
-### Adding a scheme to the leakage modes
+### Adding a scheme to the fault modes
 
 `Scheme.bind` makes any pqm4 scheme *run*.  The `sweep`/`funcskip` modes need one
 more thing — an **`AnalysisProfile`** (`ucpqc/profiles/`) that supplies the
@@ -212,12 +213,10 @@ cross-implementation check (same seed, same message):
 | `examples/01_run_and_call.py` | booting the firmware vs. driving its API |
 | `examples/02_profile_and_calls.py` | where a signature spends its cycles |
 | `examples/03_fault_campaign.py` | skipping instructions in the norm check |
-| `examples/04_leakage_cpa.py` | a full CPA against the NTT, inside the emulator |
 | `examples/05_other_schemes.py` | the same code driving KEMs and other schemes |
-
-The CPA example recovers the leak of an NTT input coefficient with
-correlation 1.0 at `pqcrystals_dilithium_ntt+0x24` — the load that first
-touches it.
+| `examples/08_fault_r0_check.py` | forcing the r0 rejection check to release out-of-spec signatures |
+| `examples/09_alafa_sweep.py` | the whole-call fault sweep (mode `sweep`) |
+| `examples/10_intra_function_skip.py` | the intra-function skip sweep (mode `funcskip`) |
 
 ## How it works
 
@@ -253,10 +252,11 @@ Rough speeds on this machine: 14 MIPS unhooked (a full ML-DSA-44 signature in
   good proxy for the pqm4 cycle counts (keypair 1,286,649 reported by the
   firmware's own benchmark vs 1,286,622 counted here) but it does not model
   wait states, flash latency or pipeline effects.
-- **Leakage is idealised.** Noise-free, perfectly aligned, and a Hamming
-  weight/distance model of a register file — enough to answer *whether* and
-  *where* a value leaks, not how many real traces an attack needs. Add noise
-  with `LeakageTracer.save(..., noise=σ)`.
+- **Fault-effect, not physical leakage.** The two-key/uniformity detectors
+  measure whether a *fault* makes the output depend on the secret; they are
+  noise-free and idealised — enough to answer *whether* and *where* a fault
+  leaks, not how many real traces or faults an attack needs. (Side-channel
+  leakage-trace simulation lives on the `has-leakage` branch, not here.)
 - **No interrupts.** SysTick is modelled as a counter but its interrupt is
   never delivered, so the firmware's own overflow bookkeeping would wrap;
   `stub_cycle_counter()` replaces `hal_get_time` with the exact count instead.
@@ -272,7 +272,7 @@ isolated in one file — `ucpqc/profiles/mldsa.py`** (plus the demo scripts unde
 | Layer | Scope |
 |---|---|
 | `machine`, `elfimage`, `platform` | general — an ARM/Unicorn core, ELF loading, a board |
-| `tracing`, `faults`, `leakage`, `replay` | general — operate on instructions/registers/memory/buffers |
+| `tracing`, `faults`, `replay` | general — operate on instructions/registers/memory/buffers |
 | `assess`, `report`, `cli` | general — the mode engine and reporting, written against the profile interface |
 | `scheme` | crypto-API-general — auto-detects SIGN/KEM entry points and sizes (ML-DSA, ML-KEM, Falcon, SPHINCS+); not one specific scheme |
 | `detectors` | general — `loo_scores`, `two_key_accuracy`, `tvla_t`, `mmd_test`, `uniformity_divergence`, `band_*` take plain feature matrices |
@@ -311,7 +311,7 @@ supply is exactly this scheme-specific surface, and everything else is reused.
 must write per scheme         reused unchanged (general)
 ─────────────────────         ──────────────────────────
 fault_sites()                 machine, elfimage, platform,
-challenge()                   tracing, faults, leakage, replay,
+challenge()                   tracing, faults, replay,
 response_from_signature()     assess (engine), report, cli,
 response_from_output()        scheme (API detection),
 feature()                     detectors (except matched_filter),
@@ -328,7 +328,6 @@ ucpqc/
   scheme.py     the only scheme-aware layer: API detection and sizes
   tracing.py    profiler, call tracer, instruction and memory traces
   faults.py     fault models, injector, campaign runner
-  leakage.py    leakage models, trace sets, CPA correlation
   replay.py     capture a function's I/O, replay it in isolation under faults
   detectors.py  two-key classifier, TVLA, MMD, uniformity, band tests
   assess.py     the sweep/funcskip mode engine (scheme-agnostic)
