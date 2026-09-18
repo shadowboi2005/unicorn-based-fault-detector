@@ -85,6 +85,15 @@ def negacyclic_deconv(c, z):
     return out
 
 
+def _unpack_gamma1_group(b):
+    """The four coefficients packed into one 9-byte group of the 18-bit gamma1
+    encoding, mapped back from the stored value ``GAMMA1 - coeff``."""
+    return [GAMMA1 - (b[0] | b[1] << 8 | (b[2] & 3) << 16),
+            GAMMA1 - ((b[2] >> 2) | b[3] << 6 | (b[4] & 15) << 14),
+            GAMMA1 - ((b[4] >> 4) | b[5] << 4 | (b[6] & 63) << 12),
+            GAMMA1 - ((b[6] >> 6) | b[7] << 2 | b[8] << 10)]
+
+
 class MLDSAProfile(AnalysisProfile):
     patterns = ("ml-dsa-*", "dilithium*")
     op = "sign"
@@ -120,13 +129,9 @@ class MLDSAProfile(AnalysisProfile):
         18-bit gamma1 packing."""
         off, z = CTILDE_BYTES, []
         for _ in range(L):
-            a = artifact[off:off + POLYZ_BYTES]; off += POLYZ_BYTES
+            packed = artifact[off:off + POLYZ_BYTES]; off += POLYZ_BYTES
             for i in range(N_COEFFS // 4):
-                b = a[9 * i:9 * i + 9]
-                z += [GAMMA1 - (b[0] | b[1] << 8 | (b[2] & 3) << 16),
-                      GAMMA1 - ((b[2] >> 2) | b[3] << 6 | (b[4] & 15) << 14),
-                      GAMMA1 - ((b[4] >> 4) | b[5] << 4 | (b[6] & 63) << 12),
-                      GAMMA1 - ((b[6] >> 6) | b[7] << 2 | b[8] << 10)]
+                z += _unpack_gamma1_group(packed[9 * i:9 * i + 9])
         return np.array(z, float).reshape(L, N_COEFFS)
 
     def response_from_output(self, output):
