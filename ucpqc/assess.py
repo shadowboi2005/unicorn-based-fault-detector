@@ -104,7 +104,7 @@ def _tvla_pvalue(max_t, d):
     return float(min(1.0, d * 2.0 * stats.norm.sf(max_t)))
 
 
-def _structural_nperm(field, n_perm):
+def _structural_nperm(n_perm):
     """Cap the permutation count for the structural detector.  Its field-rank score
     has a DEGENERATE null (~0 with no leak: permuted groups stay full rank), so the
     studentised tail is razor-sharp -- a real collapse gets ``p_tail ~ 0`` and clears
@@ -114,91 +114,122 @@ def _structural_nperm(field, n_perm):
     return min(n_perm, 60)
 
 
-def _score_and_pvalue(name, feats, profile, calibrate, n_perm):
-    """Score one detector on the per-key feature lists -> ``(metric, pvalue)``.
+# -- per-detector scoring ---------------------------------------------------
+# Each scorer maps (A, B, profile, calibrate, n_perm) -> (metric, pvalue):
+#   metric  -- the raw statistic, or None when there is too little data (the caller
+#              turns that into a crash row);
+#   pvalue  -- the calibrated per-site p-value, or None in legacy mode (where the
+#              verdict is the fixed threshold in the _DETECTORS registry instead).
+# The families differ only in HOW the p-value is calibrated: a key-label permutation
+# test (classifiers + structural + mmd), an exact analytic tail (per_coord,
+# uniformity), or certainty (a spec violation is not statistical).
 
-    ``metric`` is the raw statistic (``None`` if there is too little data, which the
-    caller turns into a crash row).  ``pvalue`` is the calibrated per-site p-value
-    when ``calibrate`` is set, else ``None`` (legacy mode decides from the metric
-    alone, in :func:`_legacy_leak`).  Calibration is detector-appropriate: the
-    classifier/structural detectors are permutation-calibrated under exchangeable key
-    labels; per_coord and uniformity have exact analytic tails; a spec violation is
-    deterministic (certain when present)."""
-    A = np.array(feats["A"]); B = np.array(feats.get("B", []))
-    if name in ("two_key", "subspace", "structural", "per_coord", "mmd") \
-            and (len(A) < 3 or len(B) < 3):
+def _feature_dim(A):
+    return A.shape[1] if A.ndim > 1 else 1
+
+
+def _permutation_scored(stat, A, B, calibrate, n_perm):
+    """(metric, pvalue) for a statistic calibrated by a key-label permutation test."""
+    metric = float(stat(A, B))
+    if not calibrate:
+        return metric, None
+    _, p_emp, p_tail = detectors.perm_pvalue(stat, A, B, n_perm=n_perm)
+    return metric, detectors._resolve_p(p_emp, p_tail, n_perm)
+
+
+def _tail_resolved(obs, null, p_emp, n_perm):
+    """Resolve an empirical p-value below its floor using the Gaussian tail of a
+    precomputed null-sample array (for a detector that returns its own null)."""
+    from scipy import stats
+    sd = float(null.std(ddof=1))
+    z = (obs - float(null.mean())) / sd if sd > 0 else np.inf
+    return detectors._resolve_p(p_emp, float(stats.norm.sf(z)), n_perm)
+
+
+def _score_two_key(A, B, profile, calibrate, n_perm):
+    return _permutation_scored(detectors.two_key_accuracy, A, B, calibrate, n_perm)
+
+
+def _score_subspace(A, B, profile, calibrate, n_perm):
+    return _permutation_scored(detectors.lda_accuracy, A, B, calibrate, n_perm)
+
+
+def _score_structural(A, B, profile, calibrate, n_perm):
+    if profile.field is None:                     # scheme supplied no field-aware feature
         return None, None
+    field = profile.field
+    stat = lambda a, b: detectors.structural_leak(a, b, field)   # noqa: E731
+    return _permutation_scored(stat, A, B, calibrate, _structural_nperm(n_perm))
 
-    if name in ("two_key", "subspace", "structural"):
-        if name == "two_key":
-            stat = detectors.two_key_accuracy
-        elif name == "subspace":
-            stat = detectors.lda_accuracy
-        else:                                     # structural: field-aware rank collapse
-            if profile.field is None:
-                return None, None
-            field = profile.field
-            stat = lambda a, b: detectors.structural_leak(a, b, field)   # noqa: E731
-        metric = float(stat(A, B))
-        if not calibrate:
-            return metric, None
-        nperm = _structural_nperm(profile.field, n_perm) if name == "structural" else n_perm
-        _, p_emp, p_tail = detectors.perm_pvalue(stat, A, B, n_perm=nperm)
-        return metric, detectors._resolve_p(p_emp, p_tail, nperm)
 
-    if name == "per_coord":                       # detector A: per-coordinate max|t|
-        max_t, _ = detectors.tvla_max(A, B)
-        d = A.shape[1] if A.ndim > 1 else 1
-        return max_t, (None if not calibrate else _tvla_pvalue(max_t, d))
+def _score_mmd(A, B, profile, calibrate, n_perm):
+    obs, null, p_emp = detectors.mmd_test(A, B, n_perm=n_perm)
+    if not calibrate:
+        return obs, None
+    return obs, _tail_resolved(obs, null, p_emp, n_perm)
 
-    if name == "mmd":                             # model-agnostic two-sample (calibrated-only)
-        obs, null, p_emp = detectors.mmd_test(A, B, n_perm=n_perm)
-        if not calibrate:
-            return obs, None
-        from scipy import stats
-        sd = float(null.std(ddof=1))
-        z = (obs - float(null.mean())) / sd if sd > 0 else np.inf
-        return obs, detectors._resolve_p(p_emp, float(stats.norm.sf(z)), n_perm)
 
-    if name == "uniformity":
-        if len(A) < 1:
-            return None, None
-        pool = A.ravel()
-        chi2, dof, spike = detectors.uniformity_divergence(pool, pool.min(), pool.max())
-        if not calibrate:
-            return spike, None
-        from scipy import stats
-        return spike, float(stats.chi2.sf(chi2, dof))
+def _score_per_coord(A, B, profile, calibrate, n_perm):
+    max_t, _ = detectors.tvla_max(A, B)
+    return max_t, (None if not calibrate else _tvla_pvalue(max_t, _feature_dim(A)))
 
-    if name == "spec_aware":
-        bound = getattr(profile, "reject_bound", None)
-        if bound is None or len(A) < 1:
-            return None, None
-        pool = A.ravel()
-        frac = detectors.band_count(pool, bound) / max(pool.size, 1)
-        return frac, (0.0 if frac > 0 else 1.0)   # a spec violation is certain, not statistical
 
-    raise ValueError(f"unknown detector {name!r}")
+def _score_uniformity(A, B, profile, calibrate, n_perm):
+    if len(A) < 1:
+        return None, None
+    pool = A.ravel()
+    chi2, dof, spike = detectors.uniformity_divergence(pool, pool.min(), pool.max())
+    if not calibrate:
+        return spike, None
+    from scipy import stats
+    return spike, float(stats.chi2.sf(chi2, dof))
+
+
+def _score_spec_aware(A, B, profile, calibrate, n_perm):
+    bound = getattr(profile, "reject_bound", None)
+    if bound is None or len(A) < 1:
+        return None, None
+    frac = detectors.band_count(A.ravel(), bound) / max(A.size, 1)
+    return frac, (0.0 if frac > 0 else 1.0)       # a spec violation is certain, not statistical
+
+
+# name -> (scorer, legacy_verdict).  legacy_verdict(metric, A) -> bool is the
+# pre-calibration fixed-threshold rule, kept beside each detector for
+# --legacy-thresholds.  Detectors in _TWO_SAMPLE compare against a whole population
+# and need >= 3 items per key; the rest guard inside their own scorer.
+_DETECTORS = {
+    "two_key":    (_score_two_key,    lambda metric, A: metric >= LEAK_THRESHOLD),
+    "subspace":   (_score_subspace,   lambda metric, A: metric >= LEAK_THRESHOLD),
+    "structural": (_score_structural, lambda metric, A: metric >= STRUCTURAL_THRESHOLD),
+    "per_coord":  (_score_per_coord,  lambda metric, A: metric >= _tvla_threshold(_feature_dim(A))),
+    "mmd":        (_score_mmd,        lambda metric, A: False),   # calibrated-only detector
+    "uniformity": (_score_uniformity, lambda metric, A: metric > UNIFORMITY_SPIKE),
+    "spec_aware": (_score_spec_aware, lambda metric, A: metric > 0),
+}
+_TWO_SAMPLE = ("two_key", "subspace", "structural", "per_coord", "mmd")
+
+
+def _detector(name):
+    try:
+        return _DETECTORS[name]
+    except KeyError:
+        raise ValueError(f"unknown detector {name!r}") from None
+
+
+def _score_and_pvalue(name, feats, profile, calibrate, n_perm):
+    """Score one detector on the per-key feature lists -> (metric, pvalue), via its
+    scorer in the _DETECTORS registry."""
+    A = np.array(feats["A"]); B = np.array(feats.get("B", []))
+    if name in _TWO_SAMPLE and (len(A) < 3 or len(B) < 3):
+        return None, None
+    return _detector(name)[0](A, B, profile, calibrate, n_perm)
 
 
 def _legacy_leak(name, metric, feats, profile):
-    """The pre-calibration fixed-threshold verdict, kept for ``--legacy-thresholds``."""
+    """The pre-calibration fixed-threshold verdict, kept for --legacy-thresholds."""
     if metric is None:
         return False
-    if name in ("two_key", "subspace"):
-        return metric >= LEAK_THRESHOLD
-    if name == "structural":
-        return metric >= STRUCTURAL_THRESHOLD
-    if name == "per_coord":
-        A = np.array(feats["A"])
-        return metric >= _tvla_threshold(A.shape[1] if A.ndim > 1 else 1)
-    if name == "uniformity":
-        return metric > UNIFORMITY_SPIKE
-    if name == "spec_aware":
-        return metric > 0
-    if name == "mmd":
-        return False                              # mmd is a calibrated-only detector
-    raise ValueError(f"unknown detector {name!r}")
+    return _detector(name)[1](metric, np.array(feats["A"]))
 
 
 def _apply_correction(rows, fdr_q, correction):
@@ -219,27 +250,28 @@ def _apply_correction(rows, fdr_q, correction):
 # --------------------------------------------------------------------------
 # mode "sweep" -- whole-call skips over the operation loop
 # --------------------------------------------------------------------------
-def _run_site(scheme, profile, sk, messages, site, label, detector, budget,
-              calibrate=True, n_perm=DEFAULT_N_PERM):
-    """Run ONE sweep site (whole-call skip) and return its `SiteResult`.
+class _Unstable(Exception):
+    """Raised internally to abandon a site whose signing crashed or hung."""
 
-    Pure and deterministic given its arguments, so the serial `sweep_sites` and
-    the parallel backends share it and produce identical rows.  `site` is an int
-    address, or None for the control row.  This is the reusable, machine-in-arg
-    seam the parallel executors hook into (`scheme.machine` is the live engine).
 
-    Sites must be independent: a faulted/hung signing leaves the guest machine
-    dirty, so without isolation the next site inherits that state and its verdict
-    depends on which site ran before it -- reproducible in a fixed serial order,
-    but non-deterministic once a pool schedules sites across workers.  We snapshot
-    on entry and restore on exit so every site starts from identical clean state;
-    this makes the serial and both parallel backends agree exactly and removes the
-    spurious near-threshold "leaks" small-N sweeps used to show."""
+def _feature_for(profile, detector, machine, artifact):
+    """This detector's feature for one released signature: the field-element
+    structural feature for `structural`, else the real-valued classifier feature."""
+    c = profile.challenge(machine, artifact)
+    resp = profile.response_from_signature(artifact)
+    if detector == "structural":
+        return profile.structural_feature(c, resp)
+    return profile.feature(c, resp)
+
+
+def _collect_key_features(scheme, profile, sk, messages, site, detector, budget):
+    """Sign every message under both keys with the site's whole-call skip installed,
+    turning each released signature into this detector's feature.  Returns
+    ``(feats, crashed, unstable)``; a crashed/hung signing or a wrong-length artifact
+    abandons the site (``unstable``), which then scores as a crash row."""
     m = scheme.machine
-    guard = m.snapshot()                         # leave the machine as we found it
     feats = {"A": [], "B": []}
     crashed = 0
-    unstable = False
     try:
         for key in "AB":
             m.stub_randombytes(f"nonce-{key}".encode())
@@ -256,37 +288,56 @@ def _run_site(scheme, profile, sk, messages, site, label, detector, budget,
                     if profile.artifact_len and len(art) != profile.artifact_len:
                         crashed += 1
                         raise _Unstable
-                    c = profile.challenge(m, art)
-                    resp = profile.response_from_signature(art)
-                    # structural uses the field-element feature; all others use
-                    # the real-valued classifier feature (unchanged path)
-                    feats[key].append(
-                        profile.structural_feature(c, resp) if detector == "structural"
-                        else profile.feature(c, resp))
+                    feats[key].append(_feature_for(profile, detector, m, art))
             except _Unstable:
-                unstable = True
-                break
+                return feats, crashed, True
             finally:
                 if inj:
                     inj.detach()
-    except EmulationError:                       # matches the serial outer guard
-        feats, crashed, unstable = {"A": [], "B": []}, len(messages), True
+    except EmulationError:                       # a fault outside signing (e.g. re-expanding c)
+        return {"A": [], "B": []}, len(messages), True
+    return feats, crashed, False
+
+
+def _provisional_status(site, feats, metric, calibrate, detector, profile):
+    """The row's status before the sweep-wide correction: control and crash are
+    decided here; a calibrated detector row is 'pending' (finalized by
+    :func:`_apply_correction`), a legacy row is decided now by its fixed threshold."""
+    if site is None:
+        return "control"
+    if min(len(feats["A"]), len(feats["B"])) < 3 or metric is None:
+        return "crash"
+    if not calibrate:
+        return "LEAK" if _legacy_leak(detector, metric, feats, profile) else "ok"
+    return "pending"
+
+
+def _run_site(scheme, profile, sk, messages, site, label, detector, budget,
+              calibrate=True, n_perm=DEFAULT_N_PERM):
+    """Run ONE sweep site (whole-call skip) and return its `SiteResult`.
+
+    Pure and deterministic given its arguments, so the serial `sweep_sites` and the
+    parallel backends share it and produce identical rows.  `site` is an int address,
+    or None for the control row.
+
+    Site isolation matters: a faulted/hung signing leaves the guest dirty, so without
+    a reset the next site inherits that state and its verdict depends on execution
+    order -- fine serially, but non-deterministic once a pool schedules sites across
+    workers.  We snapshot on entry and restore on exit so every site starts clean,
+    which makes serial and both parallel backends agree exactly."""
+    m = scheme.machine
+    guard = m.snapshot()                         # leave the machine as we found it
+    try:
+        feats, crashed, unstable = _collect_key_features(
+            scheme, profile, sk, messages, site, detector, budget)
     finally:
         m.restore(guard)                         # isolate the next site from this one
-    ran = len(feats["A"]) + len(feats["B"])
     if unstable:
         metric, pvalue = None, None
     else:
         metric, pvalue = _score_and_pvalue(detector, feats, profile, calibrate, n_perm)
-    ran_ok = min(len(feats["A"]), len(feats["B"]))
-    if site is None:
-        status = "control"
-    elif ran_ok < 3 or metric is None:
-        status = "crash"
-    elif not calibrate:
-        status = "LEAK" if _legacy_leak(detector, metric, feats, profile) else "ok"
-    else:
-        status = "pending"                        # finalized by the sweep-wide FDR pass
+    status = _provisional_status(site, feats, metric, calibrate, detector, profile)
+    ran = len(feats["A"]) + len(feats["B"])
     return SiteResult(site, label, metric, status, ran, crashed, pvalue=pvalue)
 
 
@@ -417,7 +468,3 @@ def sweep_function(scheme, profile, target=None, keys=DEFAULT_KEYS, n=DEFAULT_N,
     return AssessmentResult(scheme.name, "funcskip", detector, n, rows,
                             calibrate=calibrate, fdr_q=fdr_q, correction=correction,
                             n_perm=n_perm)
-
-
-class _Unstable(Exception):
-    pass
