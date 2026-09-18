@@ -25,7 +25,8 @@ import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from . import assess as _assess
-from .assess import CAP, DEFAULT_KEYS, DEFAULT_N, AssessmentResult, SiteResult
+from .assess import (CAP, DEFAULT_KEYS, DEFAULT_N, DEFAULT_N_PERM, FDR_Q,
+                     AssessmentResult, SiteResult)
 from .scheme import SIGN
 
 __all__ = ["sweep_sites_parallel", "sweep_function_parallel", "resolve_jobs"]
@@ -82,7 +83,7 @@ _W = {}                               # per-worker state, populated by _worker_i
 
 
 def _worker_init(elf_path, platform_name, keys, n, detector, budget, seed,
-                 profile_override, site_filter):
+                 profile_override, site_filter, calibrate, n_perm):
     """Runs once per worker process: build our own machine and precompute the
     deterministic inputs (keys, messages, site labels)."""
     m, scheme, profile = _build_bound_machine(elf_path, platform_name, seed,
@@ -97,7 +98,8 @@ def _worker_init(elf_path, platform_name, keys, n, detector, budget, seed,
     _W.clear()
     _W.update(scheme=scheme, profile=profile, sk=sk,
               messages=_assess.standard_messages(n),
-              sites=sites, detector=detector, budget=budget)
+              sites=sites, detector=detector, budget=budget,
+              calibrate=calibrate, n_perm=n_perm)
 
 
 def _worker_run_site(site_addr):
@@ -105,7 +107,8 @@ def _worker_run_site(site_addr):
     label = ("no fault (control)" if site_addr is None
              else _W["sites"][site_addr])
     return _assess._run_site(_W["scheme"], _W["profile"], _W["sk"], _W["messages"],
-                             site_addr, label, _W["detector"], _W["budget"])
+                             site_addr, label, _W["detector"], _W["budget"],
+                             calibrate=_W["calibrate"], n_perm=_W["n_perm"])
 
 
 def _enumerate_sites(elf_path, platform_name, seed, profile_override, site_filter):
@@ -127,13 +130,16 @@ def _enumerate_sites(elf_path, platform_name, seed, profile_override, site_filte
 def sweep_sites_parallel(elf_path, platform_name="mps2-an386", keys=DEFAULT_KEYS,
                          n=DEFAULT_N, detector="two_key", budget=CAP, jobs=0,
                          seed=b"ucpqc", profile_override=None, site_filter=None,
-                         progress=None):
+                         progress=None, calibrate=True, n_perm=DEFAULT_N_PERM,
+                         fdr_q=FDR_Q, correction="bh"):
     """ProcessPool equivalent of `assess.sweep_sites`; bit-identical rows.
 
     `jobs<=0` uses all CPUs.  `site_filter` (a set/list of addresses) restricts
     the sweep to those sites -- used by the parity test.  Rows are gathered as
     workers finish (dynamic load-balancing for the uneven hang sites) and then
-    re-ordered to the serial control-first, addr-ascending order."""
+    re-ordered to the serial control-first, addr-ascending order.  The calibrated
+    verdict matches serial: each worker returns a per-site p-value and the
+    coordinator runs the same sweep-wide FDR pass once all rows are in."""
     scheme_name, ordered = _enumerate_sites(elf_path, platform_name, seed,
                                             profile_override, site_filter)
     workers = resolve_jobs(jobs, len(ordered))
@@ -143,7 +149,7 @@ def sweep_sites_parallel(elf_path, platform_name="mps2-an386", keys=DEFAULT_KEYS
             max_workers=workers, mp_context=ctx,
             initializer=_worker_init,
             initargs=(elf_path, platform_name, keys, n, detector, budget, seed,
-                      profile_override, site_filter)) as ex:
+                      profile_override, site_filter, calibrate, n_perm)) as ex:
         futs = {ex.submit(_worker_run_site, addr): addr for addr, _ in ordered}
         for fut in as_completed(futs):
             row = fut.result()
@@ -151,7 +157,11 @@ def sweep_sites_parallel(elf_path, platform_name="mps2-an386", keys=DEFAULT_KEYS
             if progress:
                 progress(row)               # arrives out of order; that's fine
     rows = [by_addr[addr] for addr, _ in ordered]   # re-impose serial order
-    return AssessmentResult(scheme_name, "sweep", detector, n, rows)
+    if calibrate:                                   # same sweep-wide FDR pass as serial
+        _assess._apply_correction(rows, fdr_q, correction)
+    return AssessmentResult(scheme_name, "sweep", detector, n, rows,
+                            calibrate=calibrate, fdr_q=fdr_q, correction=correction,
+                            n_perm=n_perm)
 
 
 # --------------------------------------------------------------------------
@@ -179,7 +189,7 @@ def _capture_and_enumerate(elf_path, platform_name, target_name, keys, n,
 
 
 def _fs_worker_init(elf_path, platform_name, target_name, detector, backend,
-                    budget, seed, profile_override, caps_by_key):
+                    budget, seed, profile_override, caps_by_key, calibrate, n_perm):
     from .faults import SKIP, FaultSpec        # noqa: F401 (used in run_chunk)
     m, scheme, profile = _build_bound_machine(elf_path, platform_name, seed,
                                               profile_override)
@@ -188,7 +198,7 @@ def _fs_worker_init(elf_path, platform_name, target_name, detector, backend,
     _W.clear()
     _W.update(machine=m, target=target, caps=caps_by_key,
               featurize=_assess._make_featurize(profile, detector),
-              detect=_assess._make_detect(profile, detector),
+              detect=_assess._make_detect(profile, detector, calibrate, n_perm),
               backend=backend, budget=budget,
               guard=m.snapshot())              # per-chunk sandbox baseline
 
@@ -210,11 +220,15 @@ def _fs_worker_run_chunk(pcs):
 def sweep_function_parallel(elf_path, platform_name="mps2-an386", target_name=None,
                             keys=DEFAULT_KEYS, n=DEFAULT_N, detector=None,
                             backend="call", budget=5_000_000, jobs=0,
-                            seed=b"ucpqc", profile_override=None, progress=None):
+                            seed=b"ucpqc", profile_override=None, progress=None,
+                            calibrate=True, n_perm=DEFAULT_N_PERM,
+                            fdr_q=FDR_Q, correction="bh"):
     """ProcessPool equivalent of `assess.sweep_function` (call backend only).
 
     Returns None for the snapshot backend (its captures hold a non-picklable
-    Unicorn context) so the caller can fall back to serial `sweep_function`."""
+    Unicorn context) so the caller can fall back to serial `sweep_function`.  The
+    calibrated verdict matches serial: workers return per-site p-values and the
+    coordinator runs the same sweep-wide FDR pass."""
     if backend == "snapshot":
         return None
     scheme_name, caps_by_key, det, pcs = _capture_and_enumerate(
@@ -228,14 +242,24 @@ def sweep_function_parallel(elf_path, platform_name="mps2-an386", target_name=No
             max_workers=workers, mp_context=ctx,
             initializer=_fs_worker_init,
             initargs=(elf_path, platform_name, target_name, det, backend, budget,
-                      seed, profile_override, caps_by_key)) as ex:
+                      seed, profile_override, caps_by_key, calibrate, n_perm)) as ex:
         for chunk_rows in ex.map(_fs_worker_run_chunk, chunks):   # order preserved
             for r in chunk_rows:
-                metric, is_leak = r.get("metric"), r.get("leak", False)
-                status = _assess._status(metric, is_leak, r["ran"], r["crashed"])
-                row = SiteResult(r["pc"], r["text"], metric, status,
-                                 r["ran"], r["crashed"])
+                metric, pvalue = r.get("metric"), r.get("pvalue")
+                ran, crashed = r["ran"], r["crashed"]
+                if ran < 3 or metric is None:
+                    status = "crash"
+                elif not calibrate:
+                    status = "LEAK" if r.get("leak") else "ok"
+                else:
+                    status = "pending"           # finalized by the FDR pass below
+                row = SiteResult(r["pc"], r["text"], metric, status, ran, crashed,
+                                 pvalue=pvalue)
                 rows.append(row)
                 if progress:
                     progress(row)
-    return AssessmentResult(scheme_name, "funcskip", det, n, rows)
+    if calibrate:
+        _assess._apply_correction(rows, fdr_q, correction)
+    return AssessmentResult(scheme_name, "funcskip", det, n, rows,
+                            calibrate=calibrate, fdr_q=fdr_q, correction=correction,
+                            n_perm=n_perm)

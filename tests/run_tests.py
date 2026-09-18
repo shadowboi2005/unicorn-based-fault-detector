@@ -664,7 +664,7 @@ def test_parallel_sweep_matches_serial():
     assert 0x4d5e in addrs, "the z=z+y mask add is discovered"
     subset = {0x4d5e}                             # the leak site (fast; runs cleanly)
     sites = [(a, lbl) for a, lbl in prof.fault_sites(m, op) if a in subset]
-    n = 4
+    n = 8                                         # enough for the calibrated single-site verdict to flag
     orig = type(prof).fault_sites                 # serial reference over the subset
     type(prof).fault_sites = lambda self, mm, of: sites
     try:
