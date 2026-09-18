@@ -234,38 +234,39 @@ def _replay_snapshot(machine, target, cap, spec, budget):
     return _read_out(machine, target, cap.out_ptr, ret_val)
 
 
+def _relocate_args(machine, target, cap):
+    """Rebuild the captured call's arguments in fresh scratch and return
+    ``(args, out_addr)`` (out_addr is None for a return-value target).
+
+    Machine.call's stack would clobber the captured stack addresses, so every buffer
+    is relocated -- but aliasing is PRESERVED: two args that shared a pointer in the
+    capture (an in-place op like z = z + y, where the out buffer is also an input)
+    share the relocated buffer too, or a skipped write would read the wrong (fresh)
+    buffer."""
+    args = []
+    relocated = {}                          # captured pointer -> fresh buffer
+    for i, arg_spec in enumerate(target.args[:4]):
+        if arg_spec == "scalar":
+            args.append(cap.scalars.get(i, cap.regs.get(f"r{i}", 0)))
+            continue
+        captured_ptr = cap.regs[f"r{i}"]
+        buf = relocated.get(captured_ptr)
+        if buf is None:
+            buf = machine.alloc(arg_spec[1])
+            relocated[captured_ptr] = buf
+        if arg_spec[0] == "in":
+            machine.write(buf, cap.inputs[i])
+        args.append(buf)
+    out_addr = relocated.get(cap.regs[f"r{target.out}"]) if target.out != "ret" else None
+    return args, out_addr
+
+
 def _replay_call(machine, target, cap, spec, budget):
     if target.func is None:
         raise ValueError("call backend needs a function target, not a region")
     mark = machine.scratch_mark()     # reclaim scratch after this trial
     try:
-        # relocate every buffer to fresh scratch (Machine.call's stack would
-        # clobber the captured stack addresses otherwise), PRESERVING aliasing:
-        # if two args shared a pointer in the capture (an in-place op like
-        # z = z + y, where out == a), they must share the relocated buffer too,
-        # or a skipped write would read a wrong (fresh) buffer.
-        args, out_addr = [], None
-        relocated = {}                      # captured pointer -> fresh buffer
-        for i in range(4):
-            if i >= len(target.args):
-                break
-            spec_i = target.args[i]
-            if spec_i == "scalar":
-                args.append(cap.scalars.get(i, cap.regs.get(f"r{i}", 0)))
-                continue
-            old = cap.regs[f"r{i}"]
-            size = spec_i[1]
-            buf = relocated.get(old)
-            if buf is None:
-                buf = machine.alloc(size)
-                relocated[old] = buf
-            if spec_i[0] == "in":
-                machine.write(buf, cap.inputs[i])
-            args.append(buf)
-        # resolve the output buffer from the out arg's captured pointer (works
-        # for in-place ops where the out arg is declared "in")
-        if target.out != "ret":
-            out_addr = relocated.get(cap.regs[f"r{target.out}"])
+        args, out_addr = _relocate_args(machine, target, cap)
         inj = Injector(machine, spec) if spec else None
         try:
             ret_val = machine.call(target.func, args, max_instructions=budget)
