@@ -20,25 +20,38 @@ Every flag comes from the same shape:
    instruction skip in `funcskip`, or a targeted value fault in example 08).
 4. Each faulted output is turned into a **feature**, and a **detector** asks:
    *can the two keys be told apart (or a secret be recovered) from the faulted
-   output?* A threshold gives LEAK / ok; a run that crashes/hangs is `crash`.
+   output?* The detector's statistic is turned into a **per-site p-value**
+   (permutation-calibrated under exchangeable key labels for the classifier /
+   structural detectors; an exact analytic tail for `per_coord` / `uniformity`; a
+   deterministic certainty for `spec_aware`), and a **sweep-wide Benjamini–Hochberg**
+   pass flags LEAK at a false-discovery rate `q` (default `0.01`) across all sites; a
+   run that crashes/hangs is `crash`. `--legacy-thresholds` restores the old fixed
+   cutoffs shown in the table below (decided per-site, no calibration).
 
 The feature and detector are supplied by the scheme's `AnalysisProfile`
 (`ucpqc/profiles/`); the engine (`ucpqc/assess.py`) is scheme-agnostic.
 
 ## The detectors (the "how")
 
-| detector | feature it consumes | leak rule | what it catches |
-|---|---|---|---|
-| `two_key` | matched filter of `c` against `z` (or raw bytes) | LOO nearest-mean accuracy ≥ 80% | whole-output **mean shift** by key |
-| `per_coord` (A) | same feature | max &#124;Welch t&#124; over coords ≥ Bonferroni threshold (~5.3) | leak in **one output position** |
-| `subspace` (B) | same feature | covariance-whitened (LDA) LOO accuracy ≥ 80% | leak in a **correlated subspace** |
-| `structural` (B\*) | **field elements** (Z_q / GF(16)) | rank-collapse `score = collapse·separation` ≥ 0.5 | **accumulation / recoverability** (low-dim key-dependent subspace) |
-| `uniformity` | raw nonce coefficients | largest histogram bin share > 10% | a **biased nonce** (loop-abort) |
-| `spec_aware` | raw coefficients + `reject_bound` | count of coeffs ≥ bound > 0 | a **rejection-boundary bypass** |
+The **statistic · legacy cutoff** column shows each detector's raw statistic and
+its *legacy* fixed cutoff (the `--legacy-thresholds` rule); by default the LEAK
+verdict is instead the calibrated **p-value + FDR** from step 4 above.
+
+| detector | feature it consumes | statistic · legacy cutoff | how it's calibrated | what it catches |
+|---|---|---|---|---|
+| `two_key` | matched filter of `c` against `z` (or raw bytes) | LOO nearest-mean accuracy · ≥ 80% | permutation p | whole-output **mean shift** by key |
+| `per_coord` (A) | same feature | max &#124;Welch t&#124; over coords · ≥ Bonferroni (~5.3) | analytic (Bonferroni normal tail) | leak in **one output position** |
+| `subspace` (B) | same feature | covariance-whitened (LDA) LOO accuracy · ≥ 80% | permutation p | leak in a **correlated subspace** |
+| `structural` (B\*) | **field elements** (Z_q / GF(16)) | rank-collapse `score = collapse·separation` · ≥ 0.5 | permutation p (sharp: null ≈ 0) | **accumulation / recoverability** (low-dim key-dependent subspace) |
+| `mmd` | same feature | kernel two-sample MMD² | permutation p | any **distributional** shift by key |
+| `uniformity` | raw nonce coefficients | largest histogram bin share · > 10% | analytic (χ² tail) | a **biased nonce** (loop-abort) |
+| `spec_aware` | raw coefficients + `reject_bound` | count of coeffs ≥ bound · > 0 | deterministic (p = 0 when > 0) | a **rejection-boundary bypass** |
 
 `two_key` / `per_coord` / `subspace` are the same LOO classifier under identity /
 diagonal / full covariance; `structural` is the same idea over the scheme's own
-algebra (see `ucpqc/detectors.py`).
+algebra; and one calibrator (`perm_pvalue`, generalized over the statistic) plus one
+across-site rule (`bh_fdr` / `holm_bonferroni`) serve the whole repertoire (see
+`ucpqc/detectors.py` and `ucpqc/assess.py`).
 
 ---
 
@@ -48,8 +61,8 @@ algebra (see `ucpqc/detectors.py`).
 - **Site:** `bl polyvecl_add` — `0x4d5e` in the `sweep`, `0x46e4` inside `polyvecl_add` in `funcskip`.
 - **Fault:** skip the masking add, so `z` stays `= c·s1` (the fresh nonce `y` is never added).
 - **Inputs:** 2 keys × N signatures; **feature** = `matched_filter(c, z)` — the negacyclic correlation of the sparse challenge `c` (re-expanded from `c_tilde` via the firmware's own `poly_challenge`) against the response polyvec `z` decoded from the signature. `z`'s marginal is nonce-masked, so a plain histogram is blind; the matched filter extracts the `(c, z)` joint.
-- **Detected by:** `two_key` — LOO accuracy **100%** at N=12 (chance = 50%, threshold 80%). Control (no fault) sits at chance.
-- **Also flagged by** every stronger detector, on the same inputs: `per_coord` (max&#124;t&#124; ≫ threshold), `subspace` (LDA 100%), and `structural` — which deconvolves `c` from `z` over `Z_q` to a per-signature `s1` estimate; with the mask gone every signature yields the **same** `s1`, collapsing to rank 1 (score **0.917**). This is the negacyclic-ring instance of the field-aware detector.
+- **Detected by:** `two_key` — LOO accuracy **100%** (chance = 50%). Calibrated, that is **p ≈ 1×10⁻³** (the 1/(n_perm+1) permutation floor at the default n_perm=1000) → **LEAK at FDR ≤ 0.01**; the control (no fault) sits at chance with p ≈ 0.5. (`--legacy-thresholds`: accuracy ≥ 80%, same verdict.)
+- **Also flagged by** every stronger detector, on the same inputs: `per_coord` (max&#124;t&#124; ≫ threshold), `subspace` (LDA 100%), and `structural` — which deconvolves `c` from `z` over `Z_q` to a per-signature `s1` estimate; with the mask gone every signature yields the **same** `s1`, collapsing to rank 1 (score **0.917–0.938**; calibrated **p ≈ 0** from the degenerate-null tail, so it flags the isolated site regardless of how many sites were swept). This is the negacyclic-ring instance of the field-aware detector.
 
 ### ⚠️ `mov r7, r0` output-pointer load — an isolated-replay artifact
 - **Site:** `0x46d2` (loads the `polyvecl_add` output pointer), in `funcskip`.

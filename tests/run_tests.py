@@ -420,6 +420,76 @@ def test_field_rank_known():
         assert F.rank(deficit) == 3, f"{F.name} rank deficit"
 
 
+# --- calibrated detectors: permutation p-values + multiple-testing ----------
+
+
+def test_perm_pvalue_calibrated():
+    """perm_pvalue: no separation is not significant; a planted leak floors the
+    empirical p (flagged); and _resolve_p uses the Gaussian tail only when it is at
+    the floor AND the tail is smaller."""
+    import numpy as np
+    from ucpqc.detectors import perm_pvalue, two_key_accuracy, _resolve_p
+    rng = np.random.default_rng(1)
+    A = rng.normal(size=(12, 8)); B = rng.normal(size=(12, 8))       # same distribution
+    _, pe, pt = perm_pvalue(two_key_accuracy, A, B, n_perm=500, rng=np.random.default_rng(2))
+    assert _resolve_p(pe, pt, 500) > 0.05, "no separation -> not significant"
+    A2 = rng.normal(3.0, 1.0, size=(12, 8))                          # planted leak: opposite
+    B2 = rng.normal(-3.0, 1.0, size=(12, 8))                         # means (both off-origin)
+    _, pe2, pt2 = perm_pvalue(two_key_accuracy, A2, B2, n_perm=500, rng=np.random.default_rng(3))
+    assert pe2 <= 1.0 / 501 + 1e-12, "the leak beats every permutation (empirical floor)"
+    assert _resolve_p(pe2, pt2, 500) <= 1.0 / 501 + 1e-12, "flagged at (or below) the floor"
+    # the resolution rule itself: tail is used only at the floor, only when smaller
+    floor = 1.0 / 501
+    assert _resolve_p(0.5, 1e-9, 500) == 0.5, "an unfloored empirical p ignores the tail"
+    assert _resolve_p(floor, 1e-9, 500) == 1e-9, "floored + smaller tail -> use the tail"
+    assert _resolve_p(floor, 0.3, 500) == floor, "floored + larger tail -> keep the floor"
+
+
+def test_perm_pvalue_generalizes():
+    """The one calibrator wraps the whole repertoire: lda_accuracy and a
+    structural_leak closure both flag a planted leak through perm_pvalue."""
+    import numpy as np
+    from ucpqc.detectors import (perm_pvalue, lda_accuracy, structural_leak,
+                                 PrimeField, _resolve_p)
+    rng = np.random.default_rng(4)
+    A = rng.normal(3.0, 1.0, size=(10, 6)); B = rng.normal(-3.0, 1.0, size=(10, 6))
+    _, pe, pt = perm_pvalue(lda_accuracy, A, B, n_perm=300, rng=np.random.default_rng(5))
+    assert _resolve_p(pe, pt, 300) < 0.01, "lda separates the planted shift"
+    q = 8380417                                              # Z_q: each key a repeated row
+    FA = np.tile(rng.integers(0, q, size=6), (8, 1))
+    FB = np.tile(rng.integers(0, q, size=6), (8, 1))
+    field = PrimeField(q)
+    _, pe2, pt2 = perm_pvalue(lambda a, b: structural_leak(a, b, field), FA, FB,
+                              n_perm=200, rng=np.random.default_rng(6))
+    assert _resolve_p(pe2, pt2, 200) < 0.02, "collapsed key-specific subspaces flag"
+
+
+def test_multiple_testing_corrections():
+    """bh_fdr / holm_bonferroni reproduce their textbook rejection sets, preserve
+    input order, and control false discoveries under the global null."""
+    import numpy as np
+    from ucpqc.detectors import bh_fdr, holm_bonferroni
+    p = np.array([0.001, 0.008, 0.039, 0.041, 0.9])
+    assert list(bh_fdr(p, 0.05)) == [True, True, False, False, False]
+    assert list(holm_bonferroni(p, 0.05)) == [True, True, False, False, False]
+    assert list(bh_fdr(np.array([0.9, 0.001, 0.008]), 0.05)) == [False, True, True]
+    rng = np.random.default_rng(0)
+    false_disc = [int(bh_fdr(rng.uniform(size=50), 0.05).sum()) for _ in range(200)]
+    assert np.mean(false_disc) < 0.05 * 50, "FDR controls false discoveries under the null"
+
+
+def test_tvla_pvalue_matches_threshold():
+    """The calibrated per_coord p-value is the exact dual of the legacy |t|
+    threshold: p crosses ALPHA precisely where max|t| crosses the Bonferroni bound,
+    so the already-principled detector's verdict does not drift."""
+    from ucpqc.assess import _tvla_pvalue, _tvla_threshold, ALPHA
+    for d in (1, 16, 256, 1024):
+        thr = _tvla_threshold(d, ALPHA)
+        assert _tvla_pvalue(thr, d) <= ALPHA + 1e-9, "at the threshold, p == alpha"
+        assert _tvla_pvalue(thr * 0.98, d) > ALPHA, "just below the threshold, p > alpha"
+        assert _tvla_pvalue(thr * 1.05, d) < ALPHA, "above the threshold, p < alpha"
+
+
 # --- runner -----------------------------------------------------------------
 
 
