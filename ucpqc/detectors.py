@@ -49,15 +49,16 @@ def matched_filter(c, z):
     """
     z = np.asarray(z, float)
     L, NC = z.shape
-    supp = np.nonzero(c)[0]
-    cs = np.asarray(c, float)[supp]
-    mf = np.zeros((L, NC))
-    for l in range(L):
-        zl = z[l]
+    support = np.nonzero(c)[0]                        # the sparse challenge's nonzero positions
+    c_support = np.asarray(c, float)[support]
+    filtered = np.zeros((L, NC))
+    for poly in range(L):
+        z_poly = z[poly]
         for lag in range(NC):
-            idx = supp + lag
-            mf[l, lag] = np.sum(cs * np.where(idx >= NC, -1.0, 1.0) * zl[idx % NC])
-    return mf.ravel()
+            idx = support + lag
+            sign = np.where(idx >= NC, -1.0, 1.0)     # negacyclic wrap: x^NC = -1
+            filtered[poly, lag] = np.sum(c_support * sign * z_poly[idx % NC])
+    return filtered.ravel()
 
 
 # --------------------------------------------------------------------------
@@ -116,6 +117,31 @@ def tvla_max(F0, F1):
             int(np.sum(at > TVLA_T)))
 
 
+def _top_pca_basis(X, k):
+    """Orthonormal ``D x k`` basis of the top-k principal directions of ``X``
+    (the leading right-singular vectors of the centered data)."""
+    _, _, Vt = np.linalg.svd(X - X.mean(0), full_matrices=False)
+    return Vt[:k].T
+
+
+def _pooled_within_covariance(G0, G1):
+    """Within-key covariance pooled across both keys, each centered on its own
+    mean; shape ``(d, d)``."""
+    C0, C1 = G0 - G0.mean(0), G1 - G1.mean(0)
+    pooled = (C0.T @ C0 + C1.T @ C1) / max(len(G0) + len(G1) - 2, 1)
+    return np.atleast_2d(pooled)
+
+
+def _inverse_sqrt(cov, shrink):
+    """``cov^{-1/2}`` after shrinking ``cov`` toward a scaled identity by ``shrink``
+    (Ledoit-Wolf style), so it stays invertible when D >> N."""
+    d = cov.shape[0]
+    mean_var = np.trace(cov) / d
+    shrunk = (1.0 - shrink) * cov + shrink * mean_var * np.eye(d)
+    vals, vecs = np.linalg.eigh(shrunk)
+    return vecs @ np.diag(np.clip(vals, 1e-12, None) ** -0.5) @ vecs.T
+
+
 def lda_accuracy(F0, F1, shrink=LDA_SHRINK):
     """Detector B -- covariance-aware (structural) separability.
 
@@ -141,23 +167,13 @@ def lda_accuracy(F0, F1, shrink=LDA_SHRINK):
     F0, F1 = np.asarray(F0, float), np.asarray(F1, float)
     n0, n1 = len(F0), len(F1)
     if n0 < 2 or n1 < 2:
-        return two_key_accuracy(F0, F1)
+        return two_key_accuracy(F0, F1)                    # too few to estimate a covariance
     X = np.vstack([F0, F1])
-    X = X[:, None] if X.ndim == 1 else X
-    Xc = X - X.mean(0)
-    ncomp = max(1, min(X.shape[1], n0 + n1 - 2))            # bound cov rank at N-2
-    _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
-    P = Vt[:ncomp].T                                        # D x ncomp PCA basis
-    G0, G1 = F0 @ P, F1 @ P
-    d = ncomp
-    C0, C1 = G0 - G0.mean(0), G1 - G1.mean(0)
-    S = (C0.T @ C0 + C1.T @ C1) / max(n0 + n1 - 2, 1)       # pooled within-key cov
-    S = np.atleast_2d(S)
-    mu = np.trace(S) / d
-    Sr = (1.0 - shrink) * S + shrink * mu * np.eye(d)       # shrink -> invertible
-    vals, vecs = np.linalg.eigh(Sr)
-    W = vecs @ np.diag(np.clip(vals, 1e-12, None) ** -0.5) @ vecs.T   # Sr^{-1/2}
-    return two_key_accuracy(G0 @ W, G1 @ W)                 # nearest-mean, whitened
+    n_components = max(1, min(X.shape[1], n0 + n1 - 2))     # bound the covariance rank at N-2
+    basis = _top_pca_basis(X, n_components)                # project D >> N into an estimable space
+    G0, G1 = F0 @ basis, F1 @ basis
+    whiten = _inverse_sqrt(_pooled_within_covariance(G0, G1), shrink)
+    return two_key_accuracy(G0 @ whiten, G1 @ whiten)      # nearest-mean, in the whitened space
 
 
 # --------------------------------------------------------------------------
@@ -184,23 +200,25 @@ class PrimeField(Field):
         self.name = f"GF({p})"
 
     def rank(self, M):
+        """Row rank over GF(p) by Gaussian elimination mod p (the running pivot
+        count is the rank)."""
         p = self.p
-        A = np.atleast_2d(np.asarray(M, dtype=np.int64) % p).copy()
-        rows, cols = A.shape
-        r = 0
-        for c in range(cols):                               # numpy Gaussian elim mod p
-            nz = np.nonzero(A[r:, c])[0]
-            if nz.size == 0:
+        mat = np.atleast_2d(np.asarray(M, dtype=np.int64) % p).copy()
+        rows, cols = mat.shape
+        rank = 0
+        for col in range(cols):
+            nonzero = np.nonzero(mat[rank:, col])[0]
+            if nonzero.size == 0:                           # no pivot in this column
                 continue
-            piv = r + int(nz[0])
-            A[[r, piv]] = A[[piv, r]]
-            A[r] = (A[r] * pow(int(A[r, c]), p - 2, p)) % p  # normalise pivot (Fermat inverse)
-            factors = A[:, c].copy(); factors[r] = 0         # clear column c in every other row
-            A = (A - np.outer(factors, A[r])) % p            # products < p^2 < 2^63 -> int64-safe
-            r += 1
-            if r == rows:
+            pivot = rank + int(nonzero[0])
+            mat[[rank, pivot]] = mat[[pivot, rank]]
+            mat[rank] = (mat[rank] * pow(int(mat[rank, col]), p - 2, p)) % p   # scale pivot to 1 (Fermat inverse)
+            below = mat[:, col].copy(); below[rank] = 0     # eliminate this column in every other row
+            mat = (mat - np.outer(below, mat[rank])) % p    # products < p^2 < 2^63 -> int64-safe
+            rank += 1
+            if rank == rows:
                 break
-        return r
+        return rank
 
 
 class GF2m(Field):
@@ -226,24 +244,26 @@ class GF2m(Field):
         return self._exp[(self.q - 1) - self._log[a]]
 
     def rank(self, M):
-        A = [[int(v) & (self.q - 1) for v in row] for row in np.asarray(M).tolist()]
-        rows, cols = len(A), (len(A[0]) if A else 0)
-        r = 0
-        for c in range(cols):
-            piv = next((i for i in range(r, rows) if A[i][c]), None)
-            if piv is None:
+        """Row rank over GF(2^m) by Gaussian elimination (add = XOR); the running
+        pivot count is the rank."""
+        mat = [[int(v) & (self.q - 1) for v in row] for row in np.asarray(M).tolist()]
+        rows, cols = len(mat), (len(mat[0]) if mat else 0)
+        rank = 0
+        for col in range(cols):
+            pivot = next((i for i in range(rank, rows) if mat[i][col]), None)
+            if pivot is None:                               # no pivot in this column
                 continue
-            A[r], A[piv] = A[piv], A[r]
-            inv = self._inv(A[r][c])
-            A[r] = [self._mul(v, inv) for v in A[r]]
+            mat[rank], mat[pivot] = mat[pivot], mat[rank]
+            inv = self._inv(mat[rank][col])
+            mat[rank] = [self._mul(v, inv) for v in mat[rank]]        # scale pivot to 1
             for i in range(rows):
-                if i != r and A[i][c]:
-                    f = A[i][c]
-                    A[i] = [a ^ self._mul(f, b) for a, b in zip(A[i], A[r])]
-            r += 1
-            if r == rows:
+                if i != rank and mat[i][col]:               # eliminate this column elsewhere
+                    factor = mat[i][col]
+                    mat[i] = [a ^ self._mul(factor, b) for a, b in zip(mat[i], mat[rank])]
+            rank += 1
+            if rank == rows:
                 break
-        return r
+        return rank
 
 
 def structural_leak(F0, F1, field):
@@ -265,13 +285,12 @@ def structural_leak(F0, F1, field):
     F0 = np.asarray(F0); F1 = np.asarray(F1)
     if F0.ndim == 1:
         F0 = F0[:, None]; F1 = F1[:, None]
-    # per-key ambient rank: a non-leaking key is full-rank (rank == its own N),
-    # so collapse == 0; only a genuine subspace collapse (rank << N) is flagged.
-    full = min(min(F0.shape[0], F1.shape[0]), F0.shape[1])
-    rA, rB = field.rank(F0), field.rank(F1)
-    rAB = field.rank(np.vstack([F0, F1]))
-    collapse = 1.0 - max(rA, rB) / max(full, 1)
-    separation = (rAB - max(rA, rB)) / max(min(rA, rB), 1)
+    ambient_rank = min(min(F0.shape[0], F1.shape[0]), F0.shape[1])   # rank a non-leaking key fills
+    rank_A, rank_B = field.rank(F0), field.rank(F1)
+    rank_joint = field.rank(np.vstack([F0, F1]))
+    per_key_rank = max(rank_A, rank_B)                    # both keys must collapse to score
+    collapse = 1.0 - per_key_rank / max(ambient_rank, 1)
+    separation = (rank_joint - per_key_rank) / max(min(rank_A, rank_B), 1)
     return max(0.0, collapse) * max(0.0, separation)
 
 
