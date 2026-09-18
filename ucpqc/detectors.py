@@ -20,8 +20,8 @@ import numpy as np
 __all__ = [
     "matched_filter", "loo_scores", "two_key_accuracy", "tvla_t", "tvla_max",
     "lda_accuracy", "Field", "PrimeField", "GF2m", "structural_leak",
-    "perm_pvalue", "mmd_test", "uniformity_divergence",
-    "band_count", "band_levene",
+    "perm_pvalue", "mmd_test", "bh_fdr", "holm_bonferroni",
+    "uniformity_divergence", "band_count", "band_levene",
 ]
 
 # -- detector tuning knobs (named in one place; none are scheme-specific) ---
@@ -31,6 +31,7 @@ TVLA_T = 4.5           # classic per-coordinate TVLA |t| flag (informational cou
 LDA_SHRINK = 0.1       # default within-key covariance shrinkage (lda_accuracy)
 UNIFORM_BINS = 64      # default histogram bins (uniformity_divergence)
 PERM_SEED = 0          # default RNG seed for the permutation-based detectors
+DEFAULT_N_PERM = 1000  # default key-label shuffles for perm_pvalue / mmd_test
 
 
 # --------------------------------------------------------------------------
@@ -274,21 +275,89 @@ def structural_leak(F0, F1, field):
     return max(0.0, collapse) * max(0.0, separation)
 
 
-def perm_pvalue(F0, F1, n_perm=2000, rng=None):
-    """Assumption-free permutation p-value on two_key_accuracy: how often does a
-    random key-label shuffle reach the observed separability.  Returns
-    ``(observed_accuracy, p)``.  p at the 1/(n_perm+1) floor means chance never
-    matched the real labels."""
+def perm_pvalue(stat_fn, F0, F1, n_perm=DEFAULT_N_PERM, rng=None):
+    """Permutation-calibrated p-value for any two-sample leak statistic, under the
+    null that the two key populations are exchangeable.
+
+    ``stat_fn(A, B) -> float`` is the statistic (larger = more separable) -- e.g.
+    :func:`two_key_accuracy`, :func:`lda_accuracy`, or a
+    ``lambda a, b: structural_leak(a, b, field)`` closure.  We shuffle the key
+    labels ``n_perm`` times to build the null distribution, then return THREE
+    numbers ``(observed, p_emp, p_tail)``:
+
+      * ``p_emp = (1 + #{T_b >= T_obs}) / (n_perm + 1)`` -- the assumption-free
+        empirical p-value, floored at ``1/(n_perm+1)``.
+      * ``p_tail`` -- a Gaussian upper tail on the studentised statistic
+        ``(T_obs - mean)/std`` of the null.  It RESOLVES the case where the observed
+        statistic beats every permutation (``p_emp`` pinned at the floor).  It falls
+        well below ``1/(n_perm+1)`` when the null is CONCENTRATED (e.g. the structural
+        rank score, whose null sits at ~0, so std->0 and the tail is sharp),
+        sharpening an isolated strong site; for a WIDE null (e.g. two_key at small N)
+        it stays near the floor, so a very large sweep should raise ``n_perm`` until
+        the floor clears ``q/sites``.  Used only at the floor (see ``_resolve_p``);
+        ``p_emp`` has resolution everywhere else.
+
+    Callers combine the per-site p-values across a sweep with :func:`bh_fdr` /
+    :func:`holm_bonferroni`.  ``stat_fn`` defaults are the caller's job (this stays
+    generic); the previous ``perm_pvalue(F0, F1)`` two_key-only form is now
+    ``perm_pvalue(two_key_accuracy, F0, F1)``."""
+    from scipy import stats
     rng = np.random.default_rng(PERM_SEED) if rng is None else rng
-    obs = two_key_accuracy(F0, F1)
-    X = np.vstack([np.asarray(F0, float), np.asarray(F1, float)])
+    F0 = np.asarray(F0, float); F1 = np.asarray(F1, float)
+    obs = float(stat_fn(F0, F1))
+    X = np.vstack([F0, F1])
     n = len(F0)
-    ge = 1                                            # observed counts as itself
-    for _ in range(n_perm):
+    null = np.empty(n_perm)
+    for i in range(n_perm):
         idx = rng.permutation(len(X))
-        if two_key_accuracy(X[idx[:n]], X[idx[n:]]) >= obs:
-            ge += 1
-    return obs, ge / (n_perm + 1)
+        null[i] = stat_fn(X[idx[:n]], X[idx[n:]])
+    p_emp = (1 + int(np.sum(null >= obs))) / (n_perm + 1)
+    sd = float(null.std(ddof=1))
+    z = (obs - float(null.mean())) / sd if sd > 0 else np.inf
+    p_tail = float(stats.norm.sf(z))
+    return obs, p_emp, p_tail
+
+
+def _resolve_p(p_emp, p_tail, n_perm):
+    """Combine the empirical and tail p-values from :func:`perm_pvalue`: trust the
+    assumption-free empirical p where it has resolution, and fall to the Gaussian
+    tail only when the observed statistic beat every permutation (``p_emp`` pinned
+    at the ``1/(n_perm+1)`` floor)."""
+    floor = 1.0 / (n_perm + 1)
+    return p_emp if p_emp > floor else min(p_emp, p_tail)
+
+
+def bh_fdr(pvals, q):
+    """Benjamini-Hochberg step-up rejection mask controlling the false-discovery
+    rate at level ``q``.  ``pvals`` is a 1-D array; returns a bool array (input
+    order) that is True where the null is rejected -- i.e. a genuine leak among the
+    many sites tested, with an expected false-discovery proportion <= ``q``."""
+    p = np.asarray(pvals, float)
+    m = p.size
+    if m == 0:
+        return np.zeros(0, dtype=bool)
+    order = np.argsort(p)
+    passing = p[order] <= q * (np.arange(1, m + 1) / m)
+    mask = np.zeros(m, dtype=bool)
+    hits = np.nonzero(passing)[0]
+    if hits.size:                                     # reject up to the largest passing rank
+        mask[order[: int(hits.max()) + 1]] = True
+    return mask
+
+
+def holm_bonferroni(pvals, alpha):
+    """Holm-Bonferroni step-down rejection mask controlling the family-wise error
+    rate at level ``alpha`` (stricter, fewer discoveries than :func:`bh_fdr`)."""
+    p = np.asarray(pvals, float)
+    m = p.size
+    if m == 0:
+        return np.zeros(0, dtype=bool)
+    order = np.argsort(p)
+    passing = p[order] <= alpha / (m - np.arange(m))
+    stop = m if passing.all() else int(np.nonzero(~passing)[0][0])
+    mask = np.zeros(m, dtype=bool)
+    mask[order[:stop]] = True
+    return mask
 
 
 def mmd_test(A, B, n_perm=1000, rng=None):

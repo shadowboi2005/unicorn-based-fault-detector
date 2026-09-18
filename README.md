@@ -67,7 +67,16 @@ signatures (only `z = z + y` leaks, at 100%).  `funcskip` skips every
 instruction *inside* one function by capturing its I/O once and replaying just
 that function per trial (~240x cheaper than re-signing).  Both auto-select an
 **analysis profile** from the scheme (`--profile` to override, `--detector` to
-force `two_key`/`uniformity`/`spec_aware`, `--plot DIR` to render a bar chart).
+force `two_key`/`per_coord`/`subspace`/`structural`/`mmd`/`uniformity`/`spec_aware`,
+`--plot DIR` to render a bar chart).
+
+**Calibrated verdicts.** A LEAK is not a hand-tuned cutoff: each site's detector
+statistic becomes a **per-site p-value** (a key-label permutation test for the
+classifier/structural detectors — `--n-perm`, default 1000; an exact analytic tail
+for `per_coord`/`uniformity`), and a **sweep-wide Benjamini–Hochberg** pass
+(`--fdr`, default 0.01; `--correction holm` for family-wise error) flags leaks with
+a false-discovery guarantee across all swept sites — so there is nothing per-scheme
+to tune. `--legacy-thresholds` restores the old fixed cutoffs (0.80 / 0.50 / 0.10).
 
 `--func` accepts a symbol name or one of the landmarks the framework resolves
 per scheme family (`ntt`, `invntt`, `challenge`, `decompose`, `keccak`).
@@ -208,7 +217,9 @@ function (base-class default) — override only for curated/filtered sites.
 sweep; `field`+`structural_feature` are the extra pair for the field-aware
 structural detector, and `targets()` is the extra piece for the intra-function
 `funcskip` mode. Everything else (fault-site discovery, the mode engine, the
-detectors themselves) is scheme-agnostic. The **structural feature is where the
+detectors themselves) is scheme-agnostic. A new scheme supplies **no thresholds**:
+the LEAK verdict is calibrated (permutation/analytic p-value + sweep-wide FDR), so
+the cutoffs are not per-scheme knobs. The **structural feature is where the
 scheme's algebra enters** — it is the piece expected to be supplied per scheme
 when scanning it (the framework does not infer the leak's algebraic form).
 

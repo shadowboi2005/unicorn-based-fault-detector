@@ -274,7 +274,9 @@ def cmd_sweep(args):
     """Whole-call fault sweep over the operation's inner loop (ALAFA-style)."""
     m, scheme = _machine(args)
     profile = _profile(args, scheme)
-    result = assessmod.sweep_sites(scheme, profile, n=args.n, detector=args.detector)
+    result = assessmod.sweep_sites(scheme, profile, n=args.n, detector=args.detector,
+                                   calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
+                                   fdr_q=args.fdr, correction=args.correction)
     return _emit(args, result)
 
 
@@ -290,11 +292,31 @@ def cmd_funcskip(args):
                              f"known: {', '.join(sorted(targets)) or 'none'}")
         target = targets[args.target]
     result = assessmod.sweep_function(scheme, profile, target=target, n=args.n,
-                                      detector=args.detector, backend=args.backend)
+                                      detector=args.detector, backend=args.backend,
+                                      calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
+                                      fdr_q=args.fdr, correction=args.correction)
     return _emit(args, result)
 
 
 # --- argument parsing -------------------------------------------------------
+
+
+def _add_calibration_flags(p):
+    """Shared calibration knobs for the leak-detector sweeps (sweep + funcskip).
+
+    By default every LEAK verdict is a calibrated decision: a per-site permutation/
+    analytic p-value combined across the swept sites by a false-discovery-rate rule.
+    `--legacy-thresholds` restores the old fixed cutoffs (0.80 / 0.50 / 0.10)."""
+    p.add_argument("--n-perm", type=int, default=assessmod.DEFAULT_N_PERM, dest="n_perm",
+                   help="permutation shuffles for the calibrated p-value (default %(default)s)")
+    p.add_argument("--fdr", type=float, default=assessmod.FDR_Q,
+                   help="false-discovery-rate level across swept sites (default %(default)s)")
+    p.add_argument("--correction", default="bh", choices=("bh", "holm"),
+                   help="across-site correction: bh=Benjamini-Hochberg (FDR), "
+                        "holm=Holm-Bonferroni (FWER); default bh")
+    p.add_argument("--legacy-thresholds", action="store_true", dest="legacy_thresholds",
+                   help="keep the old fixed cutoffs (0.80/0.50/0.10), decided per-site, "
+                        "with no permutation and no FDR pass")
 
 
 def build_parser():
@@ -410,9 +432,11 @@ def build_parser():
     add_elf(p)
     p.add_argument("--n", type=int, default=24, help="signatures per key")
     p.add_argument("--detector", default="two_key",
-                   choices=("two_key", "per_coord", "subspace", "structural", "uniformity", "spec_aware"))
+                   choices=("two_key", "per_coord", "subspace", "structural",
+                            "mmd", "uniformity", "spec_aware"))
     p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
     p.add_argument("--plot", help="directory to write the result bar chart into")
+    _add_calibration_flags(p)
     p.set_defaults(handler=cmd_sweep)
 
     p = sub.add_parser("funcskip", help="instruction-skip sweep inside one function "
@@ -421,11 +445,13 @@ def build_parser():
     p.add_argument("--target", help="named funcskip target (default: the profile's)")
     p.add_argument("--n", type=int, default=24, help="signatures per key")
     p.add_argument("--detector", default=None,
-                   choices=("two_key", "per_coord", "subspace", "structural", "uniformity", "spec_aware"),
+                   choices=("two_key", "per_coord", "subspace", "structural",
+                            "mmd", "uniformity", "spec_aware"),
                    help="override the profile's detector for the target")
     p.add_argument("--backend", default="call", choices=("call", "snapshot"))
     p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
     p.add_argument("--plot", help="directory to write the result bar chart into")
+    _add_calibration_flags(p)
     p.set_defaults(handler=cmd_funcskip)
 
     return parser

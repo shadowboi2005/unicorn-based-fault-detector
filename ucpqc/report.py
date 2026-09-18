@@ -22,12 +22,26 @@ def _fmt_metric(result, metric):
     return f"{metric:.3g}"
 
 
+def _fmt_p(p):
+    """Format a per-site p-value (None in legacy mode, 0 for a certain violation)."""
+    if p is None:
+        return "  -- "
+    if p <= 0:
+        return "0"
+    if p < 1e-4:
+        return f"{p:.1e}"
+    return f"{p:.4f}"
+
+
 def format_table(result):
     """Return the console table for an `AssessmentResult` as a string."""
+    calibrated = getattr(result, "calibrate", True)
+    basis = (f"FDR q={result.fdr_q:g} ({result.correction}), n_perm={result.n_perm}"
+             if calibrated else "legacy fixed thresholds")
     lines = []
     lines.append(f"{result.scheme}  mode={result.mode}  detector={result.detector}"
-                 f"  N={result.n}/key")
-    head = f"  {'addr':>8}  {'site':<34} {'metric':>7}  {'ran':>3} {'crash':>5}  status"
+                 f"  N={result.n}/key  [{basis}]")
+    head = f"  {'addr':>8}  {'site':<34} {'metric':>7} {'p':>9}  {'ran':>3} {'crash':>5}  status"
     lines.append(head)
     lines.append("  " + "-" * (len(head) - 2))
     for r in result.rows:
@@ -35,9 +49,11 @@ def format_table(result):
         addr = "" if r.addr is None else f"{r.addr:#06x}"
         flag = "  <- LEAK" if r.status == "LEAK" else ""
         lines.append(f"  {addr:>8}  {r.label:<34} {_fmt_metric(result, r.metric):>7} "
-                     f"{r.ran:>3} {r.crashed:>5}  {tag}{flag}")
+                     f"{_fmt_p(getattr(r, 'pvalue', None)):>9} {r.ran:>3} {r.crashed:>5}  "
+                     f"{tag}{flag}")
     leaks = result.leaks()
-    lines.append(f"  -> {len(leaks)} leaking site(s)"
+    basis_note = f" at FDR<={result.fdr_q:g}" if calibrated else ""
+    lines.append(f"  -> {len(leaks)} leaking site(s){basis_note}"
                  + (": " + ", ".join(f"{r.addr:#06x} {r.label}" for r in leaks)
                     if leaks else ""))
     return "\n".join(lines)
@@ -67,7 +83,8 @@ def plot_sweep(result, path):
     y = np.arange(len(names))[::-1]
     ax.barh(y, vals, color=colors, edgecolor="white")
     if result.detector in ("two_key", "uniformity"):
-        ax.axvline(80, color="#c44e52", ls="--", lw=1, label="leak threshold (80%)")
+        if not getattr(result, "calibrate", True):     # legacy: show the fixed cutoff
+            ax.axvline(80, color="#c44e52", ls="--", lw=1, label="leak threshold (80%)")
         ax.axvline(50, color="#888888", ls=":", lw=1, label="chance (50%)")
         ax.set_xlim(0, 100)
         ax.set_xlabel(f"{result.detector} metric (%)")
