@@ -29,7 +29,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from . import assess as _assess
-from .assess import CAP, DEFAULT_KEYS, DEFAULT_N, AssessmentResult, SiteResult
+from .assess import (CAP, DEFAULT_KEYS, DEFAULT_N, DEFAULT_N_PERM, FDR_Q,
+                     AssessmentResult, SiteResult)
 from .scheme import SIGN
 
 __all__ = ["sweep_sites_parallel", "sweep_function_parallel", "resolve_jobs"]
@@ -75,6 +76,8 @@ class _Cfg:
     site_filter: object = None
     target_name: object = None
     backend: str = "call"
+    calibrate: bool = True                # calibrated p-value + FDR verdict (vs legacy cutoffs)
+    n_perm: int = DEFAULT_N_PERM
 
 
 # --------------------------------------------------------------------------
@@ -120,7 +123,8 @@ def _worker_init(cfg):
         sites = {a: sites[a] for a in cfg.site_filter if a in sites}
     _tls.state = dict(scheme=scheme, profile=profile, sk=sk,
                       messages=_assess.standard_messages(cfg.n),
-                      sites=sites, detector=cfg.detector, budget=cfg.budget)
+                      sites=sites, detector=cfg.detector, budget=cfg.budget,
+                      calibrate=cfg.calibrate, n_perm=cfg.n_perm)
 
 
 def _worker_run_site(site_addr):
@@ -129,7 +133,8 @@ def _worker_run_site(site_addr):
     label = ("no fault (control)" if site_addr is None
              else st["sites"][site_addr])
     return _assess._run_site(st["scheme"], st["profile"], st["sk"], st["messages"],
-                             site_addr, label, st["detector"], st["budget"])
+                             site_addr, label, st["detector"], st["budget"],
+                             calibrate=st["calibrate"], n_perm=st["n_perm"])
 
 
 def _enumerate_sites(cfg):
@@ -151,16 +156,20 @@ def _enumerate_sites(cfg):
 def sweep_sites_parallel(elf_path, platform_name="mps2-an386", keys=DEFAULT_KEYS,
                          n=DEFAULT_N, detector="two_key", budget=CAP, jobs=0,
                          seed=b"ucpqc", profile_override=None, site_filter=None,
-                         progress=None):
+                         progress=None, calibrate=True, n_perm=DEFAULT_N_PERM,
+                         fdr_q=FDR_Q, correction="bh"):
     """ThreadPool equivalent of `assess.sweep_sites`; bit-identical rows.
 
     `jobs<=0` uses all CPUs.  `site_filter` restricts the sweep to those sites
     (used by the parity test).  Rows are gathered as workers finish (dynamic
     load-balancing for the uneven hang sites) and then re-ordered to the serial
-    control-first, addr-ascending order."""
+    control-first, addr-ascending order.  The calibrated verdict matches serial:
+    each worker returns a per-site p-value and the main thread runs the same
+    sweep-wide FDR pass once all rows are in."""
     _warn_if_gil()
     cfg = _Cfg(elf_path, platform_name, keys, n, detector, budget, seed,
-               profile_override, site_filter=site_filter)
+               profile_override, site_filter=site_filter,
+               calibrate=calibrate, n_perm=n_perm)
     scheme_name, ordered = _enumerate_sites(cfg)
     workers = resolve_jobs(jobs, len(ordered))
     by_addr = {}
@@ -173,7 +182,11 @@ def sweep_sites_parallel(elf_path, platform_name="mps2-an386", keys=DEFAULT_KEYS
             if progress:
                 progress(row)               # arrives out of order; that's fine
     rows = [by_addr[addr] for addr, _ in ordered]   # re-impose serial order
-    return AssessmentResult(scheme_name, "sweep", detector, n, rows)
+    if calibrate:                                   # same sweep-wide FDR pass as serial
+        _assess._apply_correction(rows, fdr_q, correction)
+    return AssessmentResult(scheme_name, "sweep", detector, n, rows,
+                            calibrate=calibrate, fdr_q=fdr_q, correction=correction,
+                            n_perm=n_perm)
 
 
 # --------------------------------------------------------------------------
@@ -207,7 +220,7 @@ def _fs_worker_init(cfg, det, caps_by_key):
     target = _resolve_target(profile, cfg.target_name)
     _tls.fs = dict(machine=m, target=target, caps=caps_by_key,
                    featurize=_assess._make_featurize(profile, det),
-                   detect=_assess._make_detect(profile, det),
+                   detect=_assess._make_detect(profile, det, cfg.calibrate, cfg.n_perm),
                    backend=cfg.backend, budget=cfg.budget,
                    guard=m.snapshot())          # per-chunk sandbox baseline
 
@@ -229,17 +242,22 @@ def _fs_worker_run_chunk(pcs):
 def sweep_function_parallel(elf_path, platform_name="mps2-an386", target_name=None,
                             keys=DEFAULT_KEYS, n=DEFAULT_N, detector=None,
                             backend="call", budget=5_000_000, jobs=0,
-                            seed=b"ucpqc", profile_override=None, progress=None):
+                            seed=b"ucpqc", profile_override=None, progress=None,
+                            calibrate=True, n_perm=DEFAULT_N_PERM,
+                            fdr_q=FDR_Q, correction="bh"):
     """ThreadPool equivalent of `assess.sweep_function` (call backend only).
 
     Returns None for the snapshot backend (its Snapshot context is tied to the
     capturing engine and is not portable to another thread's machine) so the
-    caller can fall back to serial `sweep_function`."""
+    caller can fall back to serial `sweep_function`.  The calibrated verdict
+    matches serial: workers return per-site p-values and the main thread runs the
+    same sweep-wide FDR pass."""
     if backend == "snapshot":
         return None
     _warn_if_gil()
     cfg = _Cfg(elf_path, platform_name, keys, n, detector, budget, seed,
-               profile_override, target_name=target_name, backend=backend)
+               profile_override, target_name=target_name, backend=backend,
+               calibrate=calibrate, n_perm=n_perm)
     scheme_name, caps_by_key, det, pcs = _capture_and_enumerate(cfg)
     workers = resolve_jobs(jobs, len(pcs))
     chunks = _chunk(pcs, workers)
@@ -248,11 +266,21 @@ def sweep_function_parallel(elf_path, platform_name="mps2-an386", target_name=No
                             initargs=(cfg, det, caps_by_key)) as ex:
         for chunk_rows in ex.map(_fs_worker_run_chunk, chunks):   # order preserved
             for r in chunk_rows:
-                metric, is_leak = r.get("metric"), r.get("leak", False)
-                status = _assess._status(metric, is_leak, r["ran"], r["crashed"])
-                row = SiteResult(r["pc"], r["text"], metric, status,
-                                 r["ran"], r["crashed"])
+                metric, pvalue = r.get("metric"), r.get("pvalue")
+                ran, crashed = r["ran"], r["crashed"]
+                if ran < 3 or metric is None:
+                    status = "crash"
+                elif not calibrate:
+                    status = "LEAK" if r.get("leak") else "ok"
+                else:
+                    status = "pending"           # finalized by the FDR pass below
+                row = SiteResult(r["pc"], r["text"], metric, status, ran, crashed,
+                                 pvalue=pvalue)
                 rows.append(row)
                 if progress:
                     progress(row)
-    return AssessmentResult(scheme_name, "funcskip", det, n, rows)
+    if calibrate:
+        _assess._apply_correction(rows, fdr_q, correction)
+    return AssessmentResult(scheme_name, "funcskip", det, n, rows,
+                            calibrate=calibrate, fdr_q=fdr_q, correction=correction,
+                            n_perm=n_perm)
