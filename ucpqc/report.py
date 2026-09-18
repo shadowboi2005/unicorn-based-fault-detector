@@ -15,10 +15,8 @@ _STATUS = {
 def _fmt_metric(result, metric):
     if metric is None:
         return "  -- "
-    if result.detector == "two_key":
+    if result.detector in ("two_key", "uniformity"):     # accuracy / bin-share, as a percent
         return f"{metric:4.0%}"
-    if result.detector == "uniformity":
-        return f"{metric:4.0%}"          # bin-share spike
     return f"{metric:.3g}"
 
 
