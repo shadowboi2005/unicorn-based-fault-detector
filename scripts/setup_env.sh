@@ -34,8 +34,8 @@ if ! "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
     curl -fsSL https://bootstrap.pypa.io/get-pip.py | "$VENV/bin/python"
 fi
 
-echo ">> installing free-threaded wheels: numpy scipy capstone pyelftools"
-"$VENV/bin/pip" install --only-binary=:all: numpy scipy capstone pyelftools
+echo ">> installing free-threaded wheels: numpy scipy sympy capstone pyelftools"
+"$VENV/bin/pip" install --only-binary=:all: numpy scipy sympy capstone pyelftools
 
 echo ">> installing unicorn 2.1.4 (abi3 wheel contents; pure ctypes)"
 SP="$(echo "$VENV"/lib/python3.14t/site-packages)"
@@ -56,10 +56,11 @@ fi
 
 echo ">> verifying"
 "$VENV/bin/python" - <<'PY'
-import sys, unicorn, numpy, scipy
+import sys, unicorn, numpy, scipy, sympy
 assert not sys._is_gil_enabled(), "GIL is enabled -- not a free-threaded interpreter"
 print(f"OK  python {sys.version.split()[0]} (GIL disabled)  "
-      f"unicorn {unicorn.__version__}  numpy {numpy.__version__}  scipy {scipy.__version__}")
+      f"unicorn {unicorn.__version__}  numpy {numpy.__version__}  "
+      f"scipy {scipy.__version__}  sympy {sympy.__version__}")
 PY
 
 echo
