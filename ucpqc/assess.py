@@ -194,6 +194,28 @@ def _score_spec_aware(A, B, profile, calibrate, n_perm):
     return frac, (0.0 if frac > 0 else 1.0)       # a spec violation is certain, not statistical
 
 
+def _score_differential(A, B, profile, calibrate, n_perm, golden=None):
+    """#3: flag a key-dependent fault EFFECT.  Per item the effect is the magnitude of
+    change from the golden (unfaulted) output, ``||faulted_z[i] - golden_z[i]||``, and
+    the detector asks whether that effect is key-separable -- i.e. the fault matters for
+    one key but not the other.  Magnitude (not the signed delta) keeps it nonce-neutral:
+    mask removal (delta = -y) changes both keys similarly and does NOT fire here (that
+    leak is two_key's); only a key-dependent *effectiveness* does.  Needs the golden
+    baseline (returns None without it)."""
+    if golden is None:
+        return None, None
+    gA = np.asarray(golden.get("A", []), float); gB = np.asarray(golden.get("B", []), float)
+    nA, nB = min(len(A), len(gA)), min(len(B), len(gB))
+    if nA < 3 or nB < 3:
+        return None, None
+    effect_A = np.linalg.norm(A[:nA] - gA[:nA], axis=1)[:, None]   # per-item change magnitude
+    effect_B = np.linalg.norm(B[:nB] - gB[:nB], axis=1)[:, None]
+    # the effects are same-sign magnitudes, so a Welch t (not the sign-based two_key
+    # classifier) is the right 2-sample test; metric is |t|, with the analytic tail.
+    max_t, _ = detectors.tvla_max(effect_A, effect_B)
+    return max_t, (None if not calibrate else _tvla_pvalue(max_t, 1))
+
+
 # name -> (scorer, legacy_verdict).  legacy_verdict(metric, A) -> bool is the
 # pre-calibration fixed-threshold rule, kept beside each detector for
 # --legacy-thresholds.  Detectors in _TWO_SAMPLE compare against a whole population
@@ -206,8 +228,9 @@ _DETECTORS = {
     "mmd":        (_score_mmd,        lambda metric, A: False),   # calibrated-only detector
     "uniformity": (_score_uniformity, lambda metric, A: metric > UNIFORMITY_SPIKE),
     "spec_aware": (_score_spec_aware, lambda metric, A: metric > 0),
+    "differential": (_score_differential, lambda metric, A: metric >= _tvla_threshold(1)),
 }
-_TWO_SAMPLE = ("two_key", "subspace", "structural", "per_coord", "mmd")
+_TWO_SAMPLE = ("two_key", "subspace", "structural", "per_coord", "mmd", "differential")
 
 
 def _detector(name):
