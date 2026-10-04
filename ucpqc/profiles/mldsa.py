@@ -10,7 +10,7 @@ import struct
 
 import numpy as np
 
-from ..detectors import PrimeField, matched_filter
+from ..detectors import PrimeField, band_count, matched_filter
 from ..replay import Target
 from . import AnalysisProfile, register
 
@@ -92,6 +92,23 @@ def _unpack_gamma1_group(b):
             GAMMA1 - ((b[2] >> 2) | b[3] << 6 | (b[4] & 15) << 14),
             GAMMA1 - ((b[4] >> 4) | b[5] << 4 | (b[6] & 63) << 12),
             GAMMA1 - ((b[6] >> 6) | b[7] << 2 | b[8] << 10)]
+
+
+class _R0Capture:
+    """Handle for the r0 rejection observer (`r0_observer` / `force_r0_accept`):
+    `.take()` returns the out-of-spec coefficient count (coeffs >= gamma2-beta) of the
+    last signing's ACCEPTED r0 -- 0 when in spec -- and resets for the next signing;
+    `.detach()` removes the hook."""
+
+    def __init__(self, machine, handle, state):
+        self._machine, self._handle, self._state = machine, handle, state
+
+    def take(self):
+        last, self._state["last"] = self._state["last"], 0
+        return last
+
+    def detach(self):
+        self._machine.unhook(self._handle)
 
 
 class MLDSAProfile(AnalysisProfile):
@@ -187,6 +204,44 @@ class MLDSAProfile(AnalysisProfile):
         b = bytearray(sk)
         b[128] ^= 0x01                        # first byte of the packed s1 (ML-DSA-44)
         return bytes(b)
+
+    # -- r0 rejection / Finding-a-Polytope observable (#4) ------------------
+    def r0_observer(self, machine):
+        """Capture the r0 polyveck checked by each r0 rejection test (the
+        `polyveck_chknorm` call with bound R0_BOUND = gamma2-beta), keeping the
+        accepting iteration's (the last).  Feeds the `r0_reject` detector: an accepted
+        r0 out of spec is the Finding-a-Polytope (PKC 2025) leak."""
+        return self._hook_r0(machine, force=False)
+
+    def force_r0_accept(self, machine):
+        """Force the r0 rejection test to always accept (and capture the r0 it waves
+        through), so out-of-spec r0 candidates are released -- the Finding-a-Polytope
+        fault (cf. example 08)."""
+        return self._hook_r0(machine, force=True)
+
+    def _hook_r0(self, machine, force):
+        # This firmware's r0 check is poly_chknorm(r0[i], R0_BOUND) per poly (K calls
+        # per iteration, bound = gamma2-beta), not a single polyveck_chknorm.  We
+        # accumulate the out-of-spec coefficient count across one iteration's r0 burst
+        # and keep the last burst's total -- the ACCEPTED candidate's r0.
+        addr = machine.addr_of("pqcrystals_dilithium_poly_chknorm")
+        state = {"cur": 0, "last": 0, "in_r0": False}
+
+        def on_chknorm(m, a, s):
+            if m.reg("r1") != R0_BOUND:       # z-norm / ct0 checks end the r0 burst
+                state["in_r0"] = False
+                return
+            if not state["in_r0"]:            # start of a fresh r0 burst (new iteration)
+                state["cur"], state["in_r0"] = 0, True
+            poly = np.frombuffer(m.read(m.reg("r0"), N_COEFFS * 4), dtype="<i4")
+            state["cur"] += band_count(poly, R0_BOUND)
+            state["last"] = state["cur"]
+            if force:                         # wave this r0 poly through (bypass reject)
+                m.set_reg("r0", 0)
+                m.set_pc(m.reg("lr"))
+
+        handle = machine.hook_code(on_chknorm, begin=addr, end=addr, precise=False)
+        return _R0Capture(machine, handle, state)
 
 
 def unpack_s1(sk):
