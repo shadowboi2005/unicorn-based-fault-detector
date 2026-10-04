@@ -490,6 +490,18 @@ def test_tvla_pvalue_matches_threshold():
         assert _tvla_pvalue(thr * 1.05, d) < ALPHA, "above the threshold, p < alpha"
 
 
+def test_ineffective_fraction():
+    """#2: fraction of faulted artifacts byte-identical to the golden baseline."""
+    from ucpqc.assess import _ineffective_fraction
+    golden = {"A": [b"xx", b"yy", b"zz"], "B": [b"aa", b"bb"]}
+    assert _ineffective_fraction(golden, golden) == 1.0          # all unchanged
+    faulted = {"A": [b"XX", b"YY", b"ZZ"], "B": [b"AA", b"BB"]}
+    assert _ineffective_fraction(faulted, golden) == 0.0         # all changed
+    mixed = {"A": [b"xx", b"YY"], "B": [b"aa"]}                  # xx==, YY!=, aa== -> 2/3
+    assert abs(_ineffective_fraction(mixed, golden) - 2 / 3) < 1e-9
+    assert _ineffective_fraction(faulted, None) is None          # no baseline
+
+
 # --- runner -----------------------------------------------------------------
 
 

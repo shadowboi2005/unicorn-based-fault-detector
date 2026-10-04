@@ -31,6 +31,12 @@ def _fmt_p(p):
     return f"{p:.4f}"
 
 
+def _fmt_ineff(v):
+    """Format the ineffective-fault fraction (#2): share of faulted outputs identical
+    to golden (the fault was a no-op)."""
+    return "  -- " if v is None else f"{v:4.0%}"
+
+
 def format_table(result):
     """Return the console table for an `AssessmentResult` as a string."""
     calibrated = getattr(result, "calibrate", True)
@@ -39,7 +45,8 @@ def format_table(result):
     lines = []
     lines.append(f"{result.scheme}  mode={result.mode}  detector={result.detector}"
                  f"  N={result.n}/key  [{basis}]")
-    head = f"  {'addr':>8}  {'site':<34} {'metric':>7} {'p':>9}  {'ran':>3} {'crash':>5}  status"
+    head = (f"  {'addr':>8}  {'site':<34} {'metric':>7} {'p':>9} {'ineff':>6}"
+            f"  {'ran':>3} {'crash':>5}  status")
     lines.append(head)
     lines.append("  " + "-" * (len(head) - 2))
     for r in result.rows:
@@ -47,8 +54,9 @@ def format_table(result):
         addr = "" if r.addr is None else f"{r.addr:#06x}"
         flag = "  <- LEAK" if r.status == "LEAK" else ""
         lines.append(f"  {addr:>8}  {r.label:<34} {_fmt_metric(result, r.metric):>7} "
-                     f"{_fmt_p(getattr(r, 'pvalue', None)):>9} {r.ran:>3} {r.crashed:>5}  "
-                     f"{tag}{flag}")
+                     f"{_fmt_p(getattr(r, 'pvalue', None)):>9} "
+                     f"{_fmt_ineff(getattr(r, 'ineffective', None)):>6} "
+                     f"{r.ran:>3} {r.crashed:>5}  {tag}{flag}")
     leaks = result.leaks()
     basis_note = f" at FDR<={result.fdr_q:g}" if calibrated else ""
     lines.append(f"  -> {len(leaks)} leaking site(s){basis_note}"

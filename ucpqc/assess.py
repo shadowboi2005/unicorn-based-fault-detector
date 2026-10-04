@@ -49,6 +49,7 @@ class SiteResult:
     ran: int = 0
     crashed: int = 0
     pvalue: object = None              # calibrated per-site p-value (None in legacy mode)
+    ineffective: object = None         # fraction of faulted outputs identical to golden (#2)
 
 
 @dataclass
@@ -216,13 +217,17 @@ def _detector(name):
         raise ValueError(f"unknown detector {name!r}") from None
 
 
-def _score_and_pvalue(name, feats, profile, calibrate, n_perm):
+def _score_and_pvalue(name, feats, profile, calibrate, n_perm, golden=None):
     """Score one detector on the per-key feature lists -> (metric, pvalue), via its
-    scorer in the _DETECTORS registry."""
+    scorer in the _DETECTORS registry.  `golden` (the control baseline's per-key
+    features) is only used by the `differential` detector."""
     A = np.array(feats["A"]); B = np.array(feats.get("B", []))
     if name in _TWO_SAMPLE and (len(A) < 3 or len(B) < 3):
         return None, None
-    return _detector(name)[0](A, B, profile, calibrate, n_perm)
+    scorer = _detector(name)[0]
+    if name == "differential":
+        return scorer(A, B, profile, calibrate, n_perm, golden)
+    return scorer(A, B, profile, calibrate, n_perm)
 
 
 def _legacy_leak(name, metric, feats, profile):
@@ -255,10 +260,14 @@ class _Unstable(Exception):
 
 
 def _feature_for(profile, detector, machine, artifact):
-    """This detector's feature for one released signature: the field-element
-    structural feature for `structural`, else the real-valued classifier feature."""
-    c = profile.challenge(machine, artifact)
+    """This detector's feature for one released signature: the raw response for the
+    `differential` detector (its effect is computed against the golden baseline),
+    the field-element feature for `structural`, else the real-valued classifier
+    feature."""
     resp = profile.response_from_signature(artifact)
+    if detector == "differential":
+        return np.asarray(resp, float).ravel()   # raw z; no challenge expansion needed
+    c = profile.challenge(machine, artifact)
     if detector == "structural":
         return profile.structural_feature(c, resp)
     return profile.feature(c, resp)
@@ -266,11 +275,14 @@ def _feature_for(profile, detector, machine, artifact):
 
 def _collect_key_features(scheme, profile, sk, messages, site, detector, budget):
     """Sign every message under both keys with the site's whole-call skip installed,
-    turning each released signature into this detector's feature.  Returns
-    ``(feats, crashed, unstable)``; a crashed/hung signing or a wrong-length artifact
+    turning each released signature into this detector's feature AND keeping the raw
+    artifact bytes.  Returns ``(feats, arts, crashed, unstable)``; the raw artifacts
+    (paired with the golden baseline by nonce) feed the ineffective-fault and
+    differential measurements.  A crashed/hung signing or a wrong-length artifact
     abandons the site (``unstable``), which then scores as a crash row."""
     m = scheme.machine
     feats = {"A": [], "B": []}
+    arts = {"A": [], "B": []}
     crashed = 0
     try:
         for key in "AB":
@@ -288,15 +300,32 @@ def _collect_key_features(scheme, profile, sk, messages, site, detector, budget)
                     if profile.artifact_len and len(art) != profile.artifact_len:
                         crashed += 1
                         raise _Unstable
+                    arts[key].append(bytes(art))
                     feats[key].append(_feature_for(profile, detector, m, art))
             except _Unstable:
-                return feats, crashed, True
+                return feats, arts, crashed, True
             finally:
                 if inj:
                     inj.detach()
     except EmulationError:                       # a fault outside signing (e.g. re-expanding c)
-        return {"A": [], "B": []}, len(messages), True
-    return feats, crashed, False
+        return {"A": [], "B": []}, {"A": [], "B": []}, len(messages), True
+    return feats, arts, crashed, False
+
+
+def _ineffective_fraction(arts, golden_arts):
+    """Fraction of faulted artifacts byte-identical to the golden (unfaulted) artifact
+    for the same (key, item) -- i.e. the fault was a no-op (#2).  None when there is no
+    golden baseline (the control row) or nothing ran."""
+    if golden_arts is None:
+        return None
+    same = total = 0
+    for key in ("A", "B"):
+        g = golden_arts.get(key, [])
+        for i, art in enumerate(arts.get(key, [])):
+            if i < len(g):
+                total += 1
+                same += (art == g[i])
+    return (same / total) if total else None
 
 
 def _provisional_status(site, feats, metric, calibrate, detector, profile):
@@ -313,12 +342,14 @@ def _provisional_status(site, feats, metric, calibrate, detector, profile):
 
 
 def _run_site(scheme, profile, sk, messages, site, label, detector, budget,
-              calibrate=True, n_perm=DEFAULT_N_PERM):
-    """Run ONE sweep site (whole-call skip) and return its `SiteResult`.
+              calibrate=True, n_perm=DEFAULT_N_PERM, golden=None):
+    """Run ONE sweep site (whole-call skip) and return ``(SiteResult, collected)``.
 
     Pure and deterministic given its arguments, so the serial `sweep_sites` and the
     parallel backends share it and produce identical rows.  `site` is an int address,
-    or None for the control row.
+    or None for the control row.  `golden` is the control row's `collected` data
+    (``{feats, arts}``); the caller feeds the control's output back in as the baseline
+    for every faulted site (ineffective-fault metric and differential detector).
 
     Site isolation matters: a faulted/hung signing leaves the guest dirty, so without
     a reset the next site inherits that state and its verdict depends on execution
@@ -328,17 +359,23 @@ def _run_site(scheme, profile, sk, messages, site, label, detector, budget,
     m = scheme.machine
     guard = m.snapshot()                         # leave the machine as we found it
     try:
-        feats, crashed, unstable = _collect_key_features(
+        feats, arts, crashed, unstable = _collect_key_features(
             scheme, profile, sk, messages, site, detector, budget)
     finally:
         m.restore(guard)                         # isolate the next site from this one
     if unstable:
         metric, pvalue = None, None
     else:
-        metric, pvalue = _score_and_pvalue(detector, feats, profile, calibrate, n_perm)
+        golden_feats = golden["feats"] if golden else None
+        metric, pvalue = _score_and_pvalue(detector, feats, profile, calibrate, n_perm,
+                                            golden_feats)
     status = _provisional_status(site, feats, metric, calibrate, detector, profile)
     ran = len(feats["A"]) + len(feats["B"])
-    return SiteResult(site, label, metric, status, ran, crashed, pvalue=pvalue)
+    ineffective = None if site is None else _ineffective_fraction(
+        arts, golden["arts"] if golden else None)
+    row = SiteResult(site, label, metric, status, ran, crashed,
+                     pvalue=pvalue, ineffective=ineffective)
+    return row, {"feats": feats, "arts": arts}
 
 
 def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
@@ -359,10 +396,13 @@ def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
     sites = [(None, "no fault (control)")] + list(profile.fault_sites(m, op_func))
 
     rows = []
+    golden = None                                # the control row becomes the baseline
     for site, label in sites:
-        row = _run_site(scheme, profile, sk, messages, site, label, detector, budget,
-                        calibrate=calibrate, n_perm=n_perm)
+        row, collected = _run_site(scheme, profile, sk, messages, site, label, detector,
+                                   budget, calibrate=calibrate, n_perm=n_perm, golden=golden)
         rows.append(row)
+        if site is None:
+            golden = collected                   # unfaulted outputs, paired by nonce
         if progress:
             progress(row)
     if calibrate:
