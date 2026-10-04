@@ -502,6 +502,25 @@ def test_ineffective_fraction():
     assert _ineffective_fraction(faulted, None) is None          # no baseline
 
 
+def test_differential_detector():
+    """#3: differential flags a key-dependent fault effect (A barely touched, B changed
+    a lot) and stays quiet on a symmetric effect (nonce-neutral change magnitude)."""
+    import numpy as np
+    from ucpqc.assess import _score_differential
+    rng = np.random.default_rng(0)
+    D, N = 16, 12
+    gA = rng.normal(size=(N, D)); gB = rng.normal(size=(N, D))      # golden baselines
+    A = gA + rng.normal(0, 0.05, size=(N, D))                      # fault barely affects A
+    B = gB + rng.normal(0, 3.0, size=(N, D))                       # ... changes B a lot
+    _, p = _score_differential(A, B, None, True, 300, golden={"A": gA, "B": gB})
+    assert p is not None and p < 0.01, f"key-dependent effect flags (p={p})"
+    A2 = gA + rng.normal(0, 3.0, size=(N, D))                      # both changed similarly
+    B2 = gB + rng.normal(0, 3.0, size=(N, D))
+    _, p2 = _score_differential(A2, B2, None, True, 300, golden={"A": gA, "B": gB})
+    assert p2 > 0.01, f"symmetric effect is not key-dependent (p={p2})"
+    assert _score_differential(A, B, None, True, 300, golden=None) == (None, None)
+
+
 # --- runner -----------------------------------------------------------------
 
 
