@@ -227,6 +227,18 @@ def _score_differential(A, B, profile, calibrate, n_perm, golden=None):
     return max_t, (None if not calibrate else _tvla_pvalue(max_t, 1))
 
 
+def _score_r0_reject(A, B, profile, calibrate, n_perm):
+    """#4 (Finding-a-Polytope): A = per-signing out-of-spec r0 coefficient counts (from
+    the profile's r0 observer).  Flag if ANY accepted signature had an out-of-spec r0
+    (coeffs >= gamma2-beta); `frac` is the share of such signatures.  Deterministic
+    (>0 is a real leak), like spec_aware but on the captured accepted r0."""
+    pool = np.asarray(A, float).ravel()
+    if pool.size < 1:
+        return None, None
+    frac = float(np.mean(pool > 0))
+    return frac, (0.0 if frac > 0 else 1.0)
+
+
 # name -> (scorer, legacy_verdict).  legacy_verdict(metric, A) -> bool is the
 # pre-calibration fixed-threshold rule, kept beside each detector for
 # --legacy-thresholds.  Detectors in _TWO_SAMPLE compare against a whole population
@@ -239,6 +251,7 @@ _DETECTORS = {
     "mmd":        (_score_mmd,        lambda metric, A: False),   # calibrated-only detector
     "uniformity": (_score_uniformity, lambda metric, A: metric > UNIFORMITY_SPIKE),
     "spec_aware": (_score_spec_aware, lambda metric, A: metric > 0),
+    "r0_reject":  (_score_r0_reject,  lambda metric, A: metric > 0),   # #4: out-of-spec accepted r0 (Finding-a-Polytope)
     "differential": (_score_differential, lambda metric, A: metric >= _tvla_threshold(1)),
 }
 _TWO_SAMPLE = ("two_key", "subspace", "structural", "per_coord", "mmd", "differential")
@@ -312,12 +325,16 @@ def _collect_key_features(scheme, profile, sk, messages, site, detector, budget)
     turning each released signature into this detector's feature AND keeping the raw
     artifact bytes.  Returns ``(feats, arts, crashed, unstable)``; the raw artifacts
     (paired with the golden baseline by nonce) feed the ineffective-fault and
-    differential measurements.  A crashed/hung signing or a wrong-length artifact
+    differential measurements.  The `r0_reject` detector instead captures the accepted
+    r0 polyveck during signing (a scheme-internal quantity, via the profile's r0
+    observer) as its feature.  A crashed/hung signing or a wrong-length artifact
     abandons the site (``unstable``), which then scores as a crash row."""
     m = scheme.machine
     feats = {"A": [], "B": []}
     arts = {"A": [], "B": []}
     crashed = 0
+    obs = (profile.r0_observer(m) if detector == "r0_reject"
+           and hasattr(profile, "r0_observer") else None)
     try:
         for key in "AB":
             m.stub_randombytes(f"nonce-{key}".encode())
@@ -335,7 +352,10 @@ def _collect_key_features(scheme, profile, sk, messages, site, detector, budget)
                         crashed += 1
                         raise _Unstable
                     arts[key].append(bytes(art))
-                    feats[key].append(_feature_for(profile, detector, m, art))
+                    if obs is not None:                   # r0_reject: per-signing out-of-spec r0 count
+                        feats[key].append(obs.take())
+                    else:
+                        feats[key].append(_feature_for(profile, detector, m, art))
             except _Unstable:
                 return feats, arts, crashed, True
             finally:
@@ -343,6 +363,9 @@ def _collect_key_features(scheme, profile, sk, messages, site, detector, budget)
                     inj.detach()
     except EmulationError:                       # a fault outside signing (e.g. re-expanding c)
         return {"A": [], "B": []}, {"A": [], "B": []}, len(messages), True
+    finally:
+        if obs is not None:
+            obs.detach()
     return feats, arts, crashed, False
 
 

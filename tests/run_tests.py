@@ -537,6 +537,30 @@ def test_sibling_key():
     assert len(scheme.sign(b"hi", skA)) == len(scheme.sign(b"hi", skB)) == 2420, "both sign"
 
 
+def test_r0_reject_detector():
+    """#4 (Finding-a-Polytope): forcing the r0 rejection check to accept releases an
+    out-of-spec r0, which the r0 observer counts; a normal accepted r0 is in spec."""
+    from ucpqc.profiles import profile_for
+    m, scheme = booted(seed=b"polytope")
+    prof = profile_for(scheme); prof.setup(m)
+    _, sk = scheme.keypair()
+
+    obs = prof.r0_observer(m)                      # normal: every accepted r0 in spec
+    oob_normal = sum(_sign_take(scheme, f"n{i}".encode(), sk, obs) for i in range(8))
+    obs.detach()
+    assert oob_normal == 0, "golden accepted r0 is always in spec"
+
+    forced = prof.force_r0_accept(m)              # the fault: out-of-spec r0 released
+    oob_forced = sum(_sign_take(scheme, f"f{i}".encode(), sk, forced) for i in range(16))
+    forced.detach()
+    assert oob_forced > 0, "forcing r0-accept releases out-of-spec r0 (the leak)"
+
+
+def _sign_take(scheme, msg, sk, cap):
+    scheme.sign(msg, sk)
+    return cap.take()
+
+
 # --- runner -----------------------------------------------------------------
 
 
