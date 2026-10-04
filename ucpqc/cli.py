@@ -276,7 +276,8 @@ def cmd_sweep(args):
     profile = _profile(args, scheme)
     result = assessmod.sweep_sites(scheme, profile, n=args.n, detector=args.detector,
                                    calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
-                                   fdr_q=args.fdr, correction=args.correction)
+                                   fdr_q=args.fdr, correction=args.correction,
+                                   key_mode=args.key_mode)
     return _emit(args, result)
 
 
@@ -294,7 +295,8 @@ def cmd_funcskip(args):
     result = assessmod.sweep_function(scheme, profile, target=target, n=args.n,
                                       detector=args.detector, backend=args.backend,
                                       calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
-                                      fdr_q=args.fdr, correction=args.correction)
+                                      fdr_q=args.fdr, correction=args.correction,
+                                      key_mode=args.key_mode)
     return _emit(args, result)
 
 
@@ -302,11 +304,15 @@ def cmd_funcskip(args):
 
 
 def _add_calibration_flags(p):
-    """Shared calibration knobs for the leak-detector sweeps (sweep + funcskip).
+    """Shared flags for the leak-detector sweeps (sweep + funcskip): calibration knobs
+    and the A/B key mode.
 
     By default every LEAK verdict is a calibrated decision: a per-site permutation/
     analytic p-value combined across the swept sites by a false-discovery-rate rule.
     `--legacy-thresholds` restores the old fixed cutoffs (0.80 / 0.50 / 0.10)."""
+    p.add_argument("--key-mode", default="independent", choices=("independent", "sibling"),
+                   help="A/B keys: independent (default) or sibling (key B = key A with "
+                        "one secret byte flipped -- a controlled minimal difference, #1)")
     p.add_argument("--n-perm", type=int, default=assessmod.DEFAULT_N_PERM, dest="n_perm",
                    help="permutation shuffles for the calibrated p-value (default %(default)s)")
     p.add_argument("--fdr", type=float, default=assessmod.FDR_Q,
