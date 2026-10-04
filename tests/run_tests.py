@@ -561,6 +561,23 @@ def _sign_take(scheme, msg, sk, cap):
     return cap.take()
 
 
+def test_sifa_detector():
+    """SIFA: a fault whose ineffectiveness is key-dependent (no-op for one key,
+    effective for the other) is flagged; a key-independent no-op rate is not."""
+    import numpy as np
+    from ucpqc.assess import _score_sifa
+
+    def ind(rate, n=20, seed=0):                 # per-item no-op indicators at a given rate
+        return (np.random.default_rng(seed).random(n) < rate).astype(float)[:, None]
+
+    _, p = _score_sifa(ind(1.0), ind(0.0), None, True, 0)        # extreme: A no-op, B effective
+    assert p is not None and p < 1e-3, f"extreme SIFA flags (p={p})"
+    _, p2 = _score_sifa(ind(0.2, 40, 1), ind(0.8, 40, 2), None, True, 0)   # partial 20% vs 80%
+    assert p2 < 0.01, f"partial SIFA flags (p={p2})"
+    _, p3 = _score_sifa(ind(0.5, 40, 3), ind(0.5, 40, 4), None, True, 0)   # same rate -> no SIFA
+    assert p3 > 0.05, f"key-independent ineffectiveness is not SIFA (p={p3})"
+
+
 # --- runner -----------------------------------------------------------------
 
 
