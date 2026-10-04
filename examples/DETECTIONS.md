@@ -44,8 +44,24 @@ verdict is instead the calibrated **p-value + FDR** from step 4 above.
 | `subspace` (B) | same feature | covariance-whitened (LDA) LOO accuracy · ≥ 80% | permutation p | leak in a **correlated subspace** |
 | `structural` (B\*) | **field elements** (Z_q / GF(16)) | rank-collapse `score = collapse·separation` · ≥ 0.5 | permutation p (sharp: null ≈ 0) | **accumulation / recoverability** (low-dim key-dependent subspace) |
 | `mmd` | same feature | kernel two-sample MMD² | permutation p | any **distributional** shift by key |
+| `differential` | raw response `z` + **golden baseline** | &#124;Welch t&#124; of &#124;&#124;faulted−golden&#124;&#124; between keys · ≥ ~2.6 | analytic (normal tail) | a **key-dependent fault *effect*** (matters for one key, not the other) |
 | `uniformity` | raw nonce coefficients | largest histogram bin share · > 10% | analytic (χ² tail) | a **biased nonce** (loop-abort) |
 | `spec_aware` | raw coefficients + `reject_bound` | count of coeffs ≥ bound · > 0 | deterministic (p = 0 when > 0) | a **rejection-boundary bypass** |
+| `r0_reject` | **captured accepted `r0`** (internal) + `reject_bound` | share of signatures with an out-of-spec accepted `r0` · > 0 | deterministic | the **r0 rejection / Finding-a-Polytope** leak (out-of-spec `r0` released) |
+
+Two additions are *not* detectors but ride alongside every sweep:
+- **`ineffective`** (a reported column): the share of a site's faulted outputs that are
+  **byte-identical to the golden (unfaulted)** output — i.e. the fault did nothing. An
+  ineffective fault cannot leak; a high share flags dead/overwritten sites.
+- **`--key-mode sibling`**: key B = key A with **one secret byte flipped** (a controlled
+  minimal A/B difference). It makes the leak signal much smaller — a stringent sensitivity
+  test: the mask-removal leak drops from 100% (independent keys) to ~50% for `two_key`.
+
+`differential` and the `ineffective` column use the **golden baseline** — the control
+row's unfaulted outputs, paired with each faulted site by nonce. `r0_reject` captures the
+accepted `r0` *during* signing (it is internal, not in the released signature) and fires
+under a verdict-forcing fault (`MLDSAProfile.force_r0_accept`), the Finding-a-Polytope
+scenario; the skip-only sweep reports 0 because skipping the r0 check hangs.
 
 `two_key` / `per_coord` / `subspace` are the same LOO classifier under identity /
 diagonal / full covariance; `structural` is the same idea over the scheme's own
