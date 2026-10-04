@@ -108,6 +108,17 @@ class AnalysisProfile:
         rejection-bound quantity).  Default: two_key."""
         return "two_key"
 
+    # -- controlled key difference (#1) -------------------------------------
+    def sibling_key(self, sk):
+        """Return a copy of secret key `sk` differing by ONE byte, for a controlled
+        minimal-difference A/B experiment (`--key-mode sibling`).  The tiny secret
+        difference makes the leak signal small -- a more stringent sensitivity test.
+        Default: flip the last byte; override per scheme to target the *leaking*
+        secret (e.g. Dilithium's s1)."""
+        b = bytearray(sk)
+        b[-1] ^= 0x01
+        return bytes(b)
+
 
 # --- helpers ---------------------------------------------------------------
 def _scan_calls(machine, func):

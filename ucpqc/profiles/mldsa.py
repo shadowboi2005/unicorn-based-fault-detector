@@ -181,6 +181,13 @@ class MLDSAProfile(AnalysisProfile):
             return "spec_aware"
         return "two_key"
 
+    def sibling_key(self, sk):
+        """Key B = key A with one byte of the packed s1 flipped (offset 128, where
+        `unpack_s1` reads), so z = c*s1 differs minimally between A and B (#1)."""
+        b = bytearray(sk)
+        b[128] ^= 0x01                        # first byte of the packed s1 (ML-DSA-44)
+        return bytes(b)
+
 
 def unpack_s1(sk):
     """Decode the secret vector s1 (L x 256, eta=2, 3-bit packing) from the

@@ -521,6 +521,22 @@ def test_differential_detector():
     assert _score_differential(A, B, None, True, 300, golden=None) == (None, None)
 
 
+def test_sibling_key():
+    """#1: sibling_key yields a secret key differing by exactly one byte in the s1
+    region; s1 changes and both keys still sign."""
+    import numpy as np
+    from ucpqc.profiles import profile_for
+    from ucpqc.profiles.mldsa import unpack_s1
+    _, scheme = booted(seed=b"sib")
+    prof = profile_for(scheme)
+    _, skA = scheme.keypair()
+    skB = prof.sibling_key(skA)
+    diff = [i for i in range(len(skA)) if skA[i] != skB[i]]
+    assert diff == [128], f"exactly one byte differs, in the s1 region: {diff}"
+    assert not np.array_equal(unpack_s1(skA), unpack_s1(skB)), "s1 actually changed"
+    assert len(scheme.sign(b"hi", skA)) == len(scheme.sign(b"hi", skB)) == 2420, "both sign"
+
+
 # --- runner -----------------------------------------------------------------
 
 

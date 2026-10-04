@@ -63,6 +63,7 @@ class AssessmentResult:
     fdr_q: float = FDR_Q               # sweep-wide FDR level (when calibrated)
     correction: str = "bh"             # "bh" (Benjamini-Hochberg) | "holm" (Bonferroni)
     n_perm: int = DEFAULT_N_PERM       # permutation count used (when calibrated)
+    key_mode: str = "independent"      # "independent" | "sibling" (one-byte key diff, #1)
 
     def leaks(self):
         return [r for r in self.rows if r.status == "LEAK"]
@@ -78,6 +79,16 @@ def standard_messages(n):
 def _keypair(scheme, seed):
     scheme.machine.stub_randombytes(seed)
     return scheme.keypair()
+
+
+def _make_keys(scheme, keys, key_mode, profile):
+    """The two secret keys for the A/B comparison.  'independent' (default): one key
+    per seed.  'sibling' (#1): key A from the first seed, key B = profile.sibling_key(skA)
+    -- a controlled one-byte difference, so only a minimal secret change separates them."""
+    if key_mode == "sibling":
+        skA = _keypair(scheme, keys[0])[1]
+        return {"A": skA, "B": profile.sibling_key(skA)}
+    return {k: _keypair(scheme, seed)[1] for k, seed in zip("AB", keys)}
 
 
 def _operation(scheme):
@@ -403,7 +414,8 @@ def _run_site(scheme, profile, sk, messages, site, label, detector, budget,
 
 def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
                 detector="two_key", budget=CAP, progress=None,
-                calibrate=True, n_perm=DEFAULT_N_PERM, fdr_q=FDR_Q, correction="bh"):
+                calibrate=True, n_perm=DEFAULT_N_PERM, fdr_q=FDR_Q, correction="bh",
+                key_mode="independent"):
     """Sweep every fault site from `profile.fault_sites`, re-running the operation
     with a persistent whole-call skip and scoring the leak of the released
     artifacts.  By default the verdict is calibrated: each site gets a permutation/
@@ -412,7 +424,7 @@ def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
     Returns an `AssessmentResult`."""
     from .scheme import SIGN
     m = scheme.machine
-    sk = {k: _keypair(scheme, seed)[1] for k, seed in zip("AB", keys)}
+    sk = _make_keys(scheme, keys, key_mode, profile)
     profile.setup(m)
     messages = standard_messages(n)
     op_func = scheme.binding.symbols["signature" if scheme.kind == SIGN else "dec"]
@@ -432,20 +444,20 @@ def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
         _apply_correction(rows, fdr_q, correction)
     return AssessmentResult(scheme.name, "sweep", detector, n, rows,
                             calibrate=calibrate, fdr_q=fdr_q, correction=correction,
-                            n_perm=n_perm)
+                            n_perm=n_perm, key_mode=key_mode)
 
 
 # --------------------------------------------------------------------------
 # mode "funcskip" -- instruction skips inside one function (capture-replay)
 # --------------------------------------------------------------------------
-def _capture_funcskip(scheme, profile, target, backend, keys, n):
+def _capture_funcskip(scheme, profile, target, backend, keys, n, key_mode="independent"):
     """Capture the target's I/O across N signings per key -> {key: [Capture]}.
 
     The expensive funcskip prelude (2*N full signings).  Factored out so a
     parallel driver can capture once on the coordinator and ship the (pure-data,
     for the call backend) captures to workers.  Shared by the serial path."""
     m = scheme.machine
-    sk = {k: _keypair(scheme, seed)[1] for k, seed in zip("AB", keys)}
+    sk = _make_keys(scheme, keys, key_mode, profile)
     profile.setup(m)
     messages = standard_messages(n)
 
@@ -497,7 +509,8 @@ def _make_detect(profile, detector, calibrate, n_perm):
 
 def sweep_function(scheme, profile, target=None, keys=DEFAULT_KEYS, n=DEFAULT_N,
                    detector=None, backend="call", budget=5_000_000, progress=None,
-                   calibrate=True, n_perm=DEFAULT_N_PERM, fdr_q=FDR_Q, correction="bh"):
+                   calibrate=True, n_perm=DEFAULT_N_PERM, fdr_q=FDR_Q, correction="bh",
+                   key_mode="independent"):
     """Capture one function's I/O across N signings per key, then replay it under
     an instruction skip at every interior site and score the leak.  `target` is a
     `replay.Target` (defaults to `profile.default_target()`).  Verdict is calibrated
@@ -506,7 +519,7 @@ def sweep_function(scheme, profile, target=None, keys=DEFAULT_KEYS, n=DEFAULT_N,
     m = scheme.machine
     target = target or profile.default_target()
     detector = detector or profile.detector_for(target)
-    caps_by_key = _capture_funcskip(scheme, profile, target, backend, keys, n)
+    caps_by_key = _capture_funcskip(scheme, profile, target, backend, keys, n, key_mode)
     featurize = _make_featurize(profile, detector)
     detect = _make_detect(profile, detector, calibrate, n_perm)
 
@@ -530,4 +543,4 @@ def sweep_function(scheme, profile, target=None, keys=DEFAULT_KEYS, n=DEFAULT_N,
         _apply_correction(rows, fdr_q, correction)
     return AssessmentResult(scheme.name, "funcskip", detector, n, rows,
                             calibrate=calibrate, fdr_q=fdr_q, correction=correction,
-                            n_perm=n_perm)
+                            n_perm=n_perm, key_mode=key_mode)
