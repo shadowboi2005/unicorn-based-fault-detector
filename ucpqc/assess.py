@@ -239,6 +239,23 @@ def _score_r0_reject(A, B, profile, calibrate, n_perm):
     return frac, (0.0 if frac > 0 else 1.0)
 
 
+def _score_sifa(A, B, profile, calibrate, n_perm):
+    """SIFA: is the fault's INEFFECTIVENESS key-dependent?  A/B are per-item no-op
+    indicators (1 = faulted output identical to golden).  A two-proportion z-test on
+    the ineffective RATES flags a fault that is a no-op for one key but effective for
+    the other (the Statistical Ineffective Fault Analysis signal).  metric = |z|, with
+    the analytic normal tail; pooled-variance z (not Welch) so the extreme case
+    (rate 1 vs 0, both zero-variance) still flags."""
+    a = np.asarray(A, float).ravel(); b = np.asarray(B, float).ravel()
+    na, nb = a.size, b.size
+    if na < 3 or nb < 3:
+        return None, None
+    pooled = (a.sum() + b.sum()) / (na + nb)
+    se = (pooled * (1 - pooled) * (1 / na + 1 / nb)) ** 0.5
+    z = 0.0 if se == 0 else abs(a.mean() - b.mean()) / se
+    return z, (None if not calibrate else _tvla_pvalue(z, 1))
+
+
 # name -> (scorer, legacy_verdict).  legacy_verdict(metric, A) -> bool is the
 # pre-calibration fixed-threshold rule, kept beside each detector for
 # --legacy-thresholds.  Detectors in _TWO_SAMPLE compare against a whole population
@@ -253,8 +270,10 @@ _DETECTORS = {
     "spec_aware": (_score_spec_aware, lambda metric, A: metric > 0),
     "r0_reject":  (_score_r0_reject,  lambda metric, A: metric > 0),   # #4: out-of-spec accepted r0 (Finding-a-Polytope)
     "differential": (_score_differential, lambda metric, A: metric >= _tvla_threshold(1)),
+    "sifa":       (_score_sifa,       lambda metric, A: metric >= _tvla_threshold(1)),   # key-dependent ineffectiveness
 }
-_TWO_SAMPLE = ("two_key", "subspace", "structural", "per_coord", "mmd", "differential")
+_TWO_SAMPLE = ("two_key", "subspace", "structural", "per_coord", "mmd",
+               "differential", "sifa")
 
 
 def _detector(name):
@@ -312,7 +331,7 @@ def _feature_for(profile, detector, machine, artifact):
     the field-element feature for `structural`, else the real-valued classifier
     feature."""
     resp = profile.response_from_signature(artifact)
-    if detector == "differential":
+    if detector in ("differential", "sifa"):
         return np.asarray(resp, float).ravel()   # raw z; no challenge expansion needed
     c = profile.challenge(machine, artifact)
     if detector == "structural":
@@ -385,6 +404,20 @@ def _ineffective_fraction(arts, golden_arts):
     return (same / total) if total else None
 
 
+def _sifa_feats(arts, golden):
+    """Per-item ineffective indicators per key (1.0 = faulted output byte-identical to
+    golden, i.e. the fault was a no-op) -- the SIFA detector's feature.  Empty without
+    a golden baseline (the control row)."""
+    if golden is None:
+        return {"A": [], "B": []}
+    g = golden["arts"]
+    out = {}
+    for key in ("A", "B"):
+        gk, ak = g.get(key, []), arts.get(key, [])
+        out[key] = [[1.0 if ak[i] == gk[i] else 0.0] for i in range(min(len(ak), len(gk)))]
+    return out
+
+
 def _provisional_status(site, feats, metric, calibrate, detector, profile):
     """The row's status before the sweep-wide correction: control and crash are
     decided here; a calibrated detector row is 'pending' (finalized by
@@ -422,6 +455,9 @@ def _run_site(scheme, profile, sk, messages, site, label, detector, budget,
         m.restore(guard)                         # isolate the next site from this one
     if unstable:
         metric, pvalue = None, None
+    elif detector == "sifa":                     # feature = per-item no-op indicators vs golden
+        metric, pvalue = _score_and_pvalue("sifa", _sifa_feats(arts, golden), profile,
+                                           calibrate, n_perm)
     else:
         golden_feats = golden["feats"] if golden else None
         metric, pvalue = _score_and_pvalue(detector, feats, profile, calibrate, n_perm,
