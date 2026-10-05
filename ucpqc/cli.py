@@ -279,7 +279,7 @@ def cmd_sweep(args):
             detector=args.detector, jobs=args.jobs, seed=args.seed.encode(),
             profile_override=getattr(args, "profile", None),
             calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
-            fdr_q=args.fdr, correction=args.correction)
+            fdr_q=args.fdr, correction=args.correction, key_mode=args.key_mode)
         return _emit(args, result)
     m, scheme = _machine(args)                    # serial reference path
     profile = _profile(args, scheme)
