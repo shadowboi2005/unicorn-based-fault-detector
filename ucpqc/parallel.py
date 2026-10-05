@@ -83,14 +83,16 @@ _W = {}                               # per-worker state, populated by _worker_i
 
 
 def _worker_init(elf_path, platform_name, keys, n, detector, budget, seed,
-                 profile_override, site_filter, calibrate, n_perm):
+                 profile_override, site_filter, calibrate, n_perm, key_mode, golden):
     """Runs once per worker process: build our own machine and precompute the
-    deterministic inputs (keys, messages, site labels)."""
+    deterministic inputs (keys, messages, site labels).  `golden` is the coordinator's
+    control-row baseline (plain picklable data), shared read-only so every faulted site
+    can compute the ineffective / differential / sifa measurements."""
     m, scheme, profile = _build_bound_machine(elf_path, platform_name, seed,
                                               profile_override)
     # same order as assess.sweep_sites (keys then setup) so the clean state each
     # site is isolated to is byte-identical to the serial engine's
-    sk = {k: _assess._keypair(scheme, s)[1] for k, s in zip("AB", keys)}
+    sk = _assess._make_keys(scheme, keys, key_mode, profile)
     profile.setup(m)
     sites = dict(profile.fault_sites(m, _op_func(scheme)))
     if site_filter is not None:
@@ -99,16 +101,16 @@ def _worker_init(elf_path, platform_name, keys, n, detector, budget, seed,
     _W.update(scheme=scheme, profile=profile, sk=sk,
               messages=_assess.standard_messages(n),
               sites=sites, detector=detector, budget=budget,
-              calibrate=calibrate, n_perm=n_perm)
+              calibrate=calibrate, n_perm=n_perm, golden=golden)
 
 
 def _worker_run_site(site_addr):
-    """Per-task: run ONE site via the shared seam and return its SiteResult."""
-    label = ("no fault (control)" if site_addr is None
-             else _W["sites"][site_addr])
-    return _assess._run_site(_W["scheme"], _W["profile"], _W["sk"], _W["messages"],
-                             site_addr, label, _W["detector"], _W["budget"],
-                             calibrate=_W["calibrate"], n_perm=_W["n_perm"])
+    """Per-task: run ONE faulted site via the shared seam and return its SiteResult."""
+    row, _ = _assess._run_site(_W["scheme"], _W["profile"], _W["sk"], _W["messages"],
+                               site_addr, _W["sites"][site_addr], _W["detector"],
+                               _W["budget"], calibrate=_W["calibrate"],
+                               n_perm=_W["n_perm"], golden=_W["golden"])
+    return row
 
 
 def _enumerate_sites(elf_path, platform_name, seed, profile_override, site_filter):
@@ -127,41 +129,59 @@ def _enumerate_sites(elf_path, platform_name, seed, profile_override, site_filte
     return name, ordered
 
 
+def _run_control(elf_path, platform_name, keys, n, detector, budget, seed,
+                 profile_override, key_mode, calibrate, n_perm):
+    """Run the control (unfaulted) row on the coordinator and return (control_row,
+    golden); golden is shipped to the workers as the baseline for the ineffective /
+    differential / sifa measurements."""
+    m, scheme, profile = _build_bound_machine(elf_path, platform_name, seed,
+                                              profile_override)
+    sk = _assess._make_keys(scheme, keys, key_mode, profile)
+    profile.setup(m)
+    return _assess._run_site(scheme, profile, sk, _assess.standard_messages(n), None,
+                             "no fault (control)", detector, budget,
+                             calibrate=calibrate, n_perm=n_perm, golden=None)
+
+
 def sweep_sites_parallel(elf_path, platform_name="mps2-an386", keys=DEFAULT_KEYS,
                          n=DEFAULT_N, detector="two_key", budget=CAP, jobs=0,
                          seed=b"ucpqc", profile_override=None, site_filter=None,
                          progress=None, calibrate=True, n_perm=DEFAULT_N_PERM,
-                         fdr_q=FDR_Q, correction="bh"):
+                         fdr_q=FDR_Q, correction="bh", key_mode="independent"):
     """ProcessPool equivalent of `assess.sweep_sites`; bit-identical rows.
 
-    `jobs<=0` uses all CPUs.  `site_filter` (a set/list of addresses) restricts
-    the sweep to those sites -- used by the parity test.  Rows are gathered as
-    workers finish (dynamic load-balancing for the uneven hang sites) and then
-    re-ordered to the serial control-first, addr-ascending order.  The calibrated
-    verdict matches serial: each worker returns a per-site p-value and the
-    coordinator runs the same sweep-wide FDR pass once all rows are in."""
+    `jobs<=0` uses all CPUs.  `site_filter` restricts the sweep to those sites (used by
+    the parity test).  The control row runs first on the coordinator to produce the
+    golden baseline, which is shipped (plain picklable data) to the workers; the faulted
+    sites then run in parallel, are gathered as they finish, re-imposed into serial
+    control-first order, and finalized by the same sweep-wide FDR pass as serial."""
     scheme_name, ordered = _enumerate_sites(elf_path, platform_name, seed,
                                             profile_override, site_filter)
-    workers = resolve_jobs(jobs, len(ordered))
+    control_row, golden = _run_control(elf_path, platform_name, keys, n, detector,
+                                       budget, seed, profile_override, key_mode,
+                                       calibrate, n_perm)
+    faulted = [sl for sl in ordered if sl[0] is not None]
+    workers = resolve_jobs(jobs, len(faulted))
     ctx = mp.get_context("spawn")
     by_addr = {}
     with ProcessPoolExecutor(
             max_workers=workers, mp_context=ctx,
             initializer=_worker_init,
             initargs=(elf_path, platform_name, keys, n, detector, budget, seed,
-                      profile_override, site_filter, calibrate, n_perm)) as ex:
-        futs = {ex.submit(_worker_run_site, addr): addr for addr, _ in ordered}
+                      profile_override, site_filter, calibrate, n_perm, key_mode,
+                      golden)) as ex:
+        futs = {ex.submit(_worker_run_site, addr): addr for addr, _ in faulted}
         for fut in as_completed(futs):
             row = fut.result()
             by_addr[row.addr] = row
             if progress:
                 progress(row)               # arrives out of order; that's fine
-    rows = [by_addr[addr] for addr, _ in ordered]   # re-impose serial order
+    rows = [control_row] + [by_addr[addr] for addr, _ in faulted]
     if calibrate:                                   # same sweep-wide FDR pass as serial
         _assess._apply_correction(rows, fdr_q, correction)
     return AssessmentResult(scheme_name, "sweep", detector, n, rows,
                             calibrate=calibrate, fdr_q=fdr_q, correction=correction,
-                            n_perm=n_perm)
+                            n_perm=n_perm, key_mode=key_mode)
 
 
 # --------------------------------------------------------------------------
