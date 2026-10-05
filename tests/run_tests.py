@@ -578,6 +578,78 @@ def test_sifa_detector():
     assert p3 > 0.05, f"key-independent ineffectiveness is not SIFA (p={p3})"
 
 
+# --- dump + offline detect --------------------------------------------------
+def _dump_small(detector="two_key", n=5, nsites=2):
+    """Run a tiny sweep with --dump into a temp dir (first `nsites` discovered sites,
+    so it stays fast) and return (dump_dir, live AssessmentResult)."""
+    import tempfile
+    from ucpqc import assess
+    from ucpqc.profiles import profile_for
+    m, scheme = booted()
+    prof = profile_for(scheme)
+    op = scheme.binding.symbols["signature"]
+    sites = list(prof.fault_sites(m, op))[:nsites]
+    prof.fault_sites = lambda machine, op_func, _s=sites: _s
+    d = tempfile.mkdtemp(prefix="ucpqc-dump-")
+    live = assess.sweep_sites(scheme, prof, n=n, detector=detector, dump=d)
+    return d, live
+
+
+def test_dump_roundtrip():
+    """`sweep --dump` writes meta/golden/site_* with well-formed records (hex artifact
+    of the right length, a per-item challenge)."""
+    import json
+    from ucpqc import dump as dumpmod
+    d, _ = _dump_small(n=5, nsites=2)
+    files = set(os.listdir(d))
+    assert {"meta.json", "golden.json"} <= files, files
+    assert any(f.startswith("site_") for f in files), "a faulted-site file is written"
+    meta, golden, sites = dumpmod.load_dump(d)
+    assert meta["scheme"].startswith("ml-dsa") and meta["mode"] == "sweep" and meta["n"] == 5
+    assert len(sites) == len(meta["sites"]) == 2
+    rec = golden["A"][0]
+    assert len(rec["artifact"]) == 2 * meta["artifact_len"], "artifact is full-length hex"
+    bytes.fromhex(rec["artifact"])                         # valid hex
+    assert len(rec["challenge"]) == 256, "challenge c is captured per item"
+    assert golden["A"][0]["msg"] == "msg-0"
+
+
+def test_detect_matches_live():
+    """The offline `detect` verdict is identical to the live sweep it was dumped from
+    -- same metric, p-value, status, and ineffective fraction per site (capture once,
+    score offline without re-emulating)."""
+    from ucpqc import assess
+    d, live = _dump_small(detector="two_key", n=6, nsites=2)
+    off = assess.assess_from_dump(d, detector="two_key")
+    assert len(off.rows) == len(live.rows)
+    for lr, orr in zip(live.rows, off.rows):
+        assert lr.addr == orr.addr
+        assert lr.metric == orr.metric, (lr.addr, lr.metric, orr.metric)
+        assert lr.pvalue == orr.pvalue, (lr.addr, lr.pvalue, orr.pvalue)
+        assert lr.status == orr.status, (lr.addr, lr.status, orr.status)
+        assert lr.ineffective == orr.ineffective, (lr.addr, lr.ineffective, orr.ineffective)
+
+
+def test_detect_reuses_dump():
+    """One dump feeds several detectors offline: the whole point of --dump is to run a
+    different detector without re-emulating.  Capture under two_key, then score both
+    two_key and structural (a different feature) off the same files."""
+    from ucpqc import assess
+    d, _ = _dump_small(detector="two_key", n=6, nsites=2)
+    r_two = assess.assess_from_dump(d, detector="two_key")
+    r_struct = assess.assess_from_dump(d, detector="structural")       # different feature, same dump
+    assert len(r_two.rows) == len(r_struct.rows) == 3
+    assert r_two.detector == "two_key" and r_struct.detector == "structural"
+    # both produce a scored (non-crash) faulted row from the same captured artifacts
+    assert any(r.metric is not None for r in r_two.rows[1:])
+    assert any(r.metric is not None for r in r_struct.rows[1:])
+    try:
+        assess.assess_from_dump(d, detector="r0_reject")
+        assert False, "r0_reject should be rejected for a skip-sweep dump"
+    except ValueError:
+        pass
+
+
 # --- runner -----------------------------------------------------------------
 
 

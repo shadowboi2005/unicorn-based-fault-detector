@@ -26,8 +26,8 @@ The profile is selected automatically from `scheme.name` via `profile_for`.
 
 import fnmatch
 
-__all__ = ["AnalysisProfile", "register", "profile_for", "profiles",
-           "discover_call_sites", "signing_body"]
+__all__ = ["AnalysisProfile", "register", "profile_for", "profile_by_name",
+           "profiles", "discover_call_sites", "signing_body"]
 
 
 class AnalysisProfile:
@@ -190,7 +190,15 @@ def profile_for(scheme, override=None):
                    for p in cls.patterns):
                 return cls()
         raise ValueError(f"no analysis profile matching --profile {override!r}")
-    name = scheme.name
+    return profile_by_name(scheme.name)
+
+
+def profile_by_name(name):
+    """Select the profile for a scheme *name string* alone -- no `scheme` object and
+    no machine.  Used by the offline `detect` path (:func:`assess.assess_from_dump`),
+    which reconstructs features from a dump: the methods it calls
+    (`response_from_signature`, `feature`, `structural_feature`) never touch the
+    emulator.  Same name matching as :func:`profile_for`."""
     for cls in profiles:
         if any(fnmatch.fnmatch(name, pat) for pat in cls.patterns):
             return cls()

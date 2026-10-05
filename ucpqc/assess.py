@@ -339,18 +339,27 @@ def _feature_for(profile, detector, machine, artifact):
     return profile.feature(c, resp)
 
 
-def _collect_key_features(scheme, profile, sk, messages, site, detector, budget):
+def _collect_key_features(scheme, profile, sk, messages, site, detector, budget, dump=False):
     """Sign every message under both keys with the site's whole-call skip installed,
     turning each released signature into this detector's feature AND keeping the raw
-    artifact bytes.  Returns ``(feats, arts, crashed, unstable)``; the raw artifacts
-    (paired with the golden baseline by nonce) feed the ineffective-fault and
+    artifact bytes.  Returns ``(feats, arts, chals, crashed, unstable)``; the raw
+    artifacts (paired with the golden baseline by nonce) feed the ineffective-fault and
     differential measurements.  The `r0_reject` detector instead captures the accepted
     r0 polyveck during signing (a scheme-internal quantity, via the profile's r0
     observer) as its feature.  A crashed/hung signing or a wrong-length artifact
-    abandons the site (``unstable``), which then scores as a crash row."""
+    abandons the site (``unstable``), which then scores as a crash row.
+
+    With ``dump``, also record the expanded challenge ``c`` per item (``chals``) -- the
+    one emulator-derived context the classifier/structural detectors need -- so the
+    whole site is replayable offline (`assess_from_dump`).  Captured in the same
+    signing context the live feature uses, for *every* detector (not just the ones
+    whose feature already expands ``c``).  Empty when ``dump`` is off or the profile
+    exposes no ``challenge``, so the hot path is unchanged."""
     m = scheme.machine
     feats = {"A": [], "B": []}
     arts = {"A": [], "B": []}
+    chals = {"A": [], "B": []}
+    want_chal = dump and hasattr(profile, "challenge")
     crashed = 0
     obs = (profile.r0_observer(m) if detector == "r0_reject"
            and hasattr(profile, "r0_observer") else None)
@@ -375,17 +384,20 @@ def _collect_key_features(scheme, profile, sk, messages, site, detector, budget)
                         feats[key].append(obs.take())
                     else:
                         feats[key].append(_feature_for(profile, detector, m, art))
+                    if want_chal:                         # dump context: c as ints, replayable offline
+                        chals[key].append([int(x) for x in profile.challenge(m, art)])
             except _Unstable:
-                return feats, arts, crashed, True
+                return feats, arts, chals, crashed, True
             finally:
                 if inj:
                     inj.detach()
     except EmulationError:                       # a fault outside signing (e.g. re-expanding c)
-        return {"A": [], "B": []}, {"A": [], "B": []}, len(messages), True
+        empty = {"A": [], "B": []}
+        return empty, {"A": [], "B": []}, {"A": [], "B": []}, len(messages), True
     finally:
         if obs is not None:
             obs.detach()
-    return feats, arts, crashed, False
+    return feats, arts, chals, crashed, False
 
 
 def _ineffective_fraction(arts, golden_arts):
@@ -432,7 +444,7 @@ def _provisional_status(site, feats, metric, calibrate, detector, profile):
 
 
 def _run_site(scheme, profile, sk, messages, site, label, detector, budget,
-              calibrate=True, n_perm=DEFAULT_N_PERM, golden=None):
+              calibrate=True, n_perm=DEFAULT_N_PERM, golden=None, dump=False):
     """Run ONE sweep site (whole-call skip) and return ``(SiteResult, collected)``.
 
     Pure and deterministic given its arguments, so the serial `sweep_sites` and the
@@ -449,8 +461,8 @@ def _run_site(scheme, profile, sk, messages, site, label, detector, budget,
     m = scheme.machine
     guard = m.snapshot()                         # leave the machine as we found it
     try:
-        feats, arts, crashed, unstable = _collect_key_features(
-            scheme, profile, sk, messages, site, detector, budget)
+        feats, arts, chals, crashed, unstable = _collect_key_features(
+            scheme, profile, sk, messages, site, detector, budget, dump=dump)
     finally:
         m.restore(guard)                         # isolate the next site from this one
     if unstable:
@@ -468,19 +480,24 @@ def _run_site(scheme, profile, sk, messages, site, label, detector, budget,
         arts, golden["arts"] if golden else None)
     row = SiteResult(site, label, metric, status, ran, crashed,
                      pvalue=pvalue, ineffective=ineffective)
-    return row, {"feats": feats, "arts": arts}
+    return row, {"feats": feats, "arts": arts, "challenges": chals}
 
 
 def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
                 detector="two_key", budget=CAP, progress=None,
                 calibrate=True, n_perm=DEFAULT_N_PERM, fdr_q=FDR_Q, correction="bh",
-                key_mode="independent"):
+                key_mode="independent", dump=None):
     """Sweep every fault site from `profile.fault_sites`, re-running the operation
     with a persistent whole-call skip and scoring the leak of the released
     artifacts.  By default the verdict is calibrated: each site gets a permutation/
     analytic p-value, then a sweep-wide Benjamini-Hochberg pass flags leaks at FDR
     `fdr_q` (`calibrate=False` restores the legacy fixed cutoffs, decided per-site).
-    Returns an `AssessmentResult`."""
+    Returns an `AssessmentResult`.
+
+    `dump` (a directory path): also write the correct (golden) and faulty runs --
+    artifact + expanded challenge per item -- as JSON there (`ucpqc.dump`), so any
+    detector can be re-run offline (`assess_from_dump`) without re-emulating.
+    Scoring is unchanged; the verdict is still returned."""
     from .scheme import SIGN
     m = scheme.machine
     sk = _make_keys(scheme, keys, key_mode, profile)
@@ -491,19 +508,135 @@ def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
 
     rows = []
     golden = None                                # the control row becomes the baseline
+    golden_records, site_records = None, []      # (dump only)
     for site, label in sites:
         row, collected = _run_site(scheme, profile, sk, messages, site, label, detector,
-                                   budget, calibrate=calibrate, n_perm=n_perm, golden=golden)
+                                   budget, calibrate=calibrate, n_perm=n_perm,
+                                   golden=golden, dump=bool(dump))
         rows.append(row)
         if site is None:
             golden = collected                   # unfaulted outputs, paired by nonce
+            if dump:
+                golden_records = _dump_records(collected, messages)
+        elif dump:
+            site_records.append({"addr": hex(site), "label": label,
+                                 **_dump_records(collected, messages)})
         if progress:
             progress(row)
     if calibrate:
         _apply_correction(rows, fdr_q, correction)
+    if dump:
+        from . import dump as dumpmod
+        meta = {"scheme": scheme.name, "mode": "sweep", "n": n, "key_mode": key_mode,
+                "detector_at_capture": detector,
+                "nonce_seeds": {"A": "nonce-A", "B": "nonce-B"},
+                "artifact_len": profile.artifact_len,
+                "sites": [{"addr": hex(s), "label": lbl} for s, lbl in sites if s is not None]}
+        dumpmod.write_dump(dump, meta, golden_records, site_records)
     return AssessmentResult(scheme.name, "sweep", detector, n, rows,
                             calibrate=calibrate, fdr_q=fdr_q, correction=correction,
                             n_perm=n_perm, key_mode=key_mode)
+
+
+def _dump_records(collected, messages):
+    """Turn one site's collected data into the per-key list of dump records
+    ``{msg, artifact (hex), challenge (ints)}``, paired by signing index."""
+    arts, chals = collected["arts"], collected.get("challenges", {})
+    out = {}
+    for key in ("A", "B"):
+        recs = []
+        ck = chals.get(key, [])
+        for i, art in enumerate(arts.get(key, [])):
+            rec = {"msg": messages[i].decode(), "artifact": art.hex()}
+            if i < len(ck):
+                rec["challenge"] = ck[i]
+            recs.append(rec)
+        out[key] = recs
+    return out
+
+
+# --------------------------------------------------------------------------
+# offline replay -- run any detector on a dumped sweep, no emulator
+# --------------------------------------------------------------------------
+DUMP_DETECTORS = tuple(d for d in _DETECTORS if d != "r0_reject")
+
+
+def _feature_from_record(profile, detector, rec):
+    """Reconstruct one detector feature from a dump record -- the offline dual of
+    `_feature_for`, sourcing the challenge from the record instead of the emulator.
+    The profile methods it calls are all pure (no machine)."""
+    resp = profile.response_from_signature(bytes.fromhex(rec["artifact"]))
+    if detector in ("differential", "sifa"):
+        return np.asarray(resp, float).ravel()
+    if "challenge" not in rec:
+        raise ValueError(f"detector {detector!r} needs the challenge, which this dump "
+                         f"does not carry; re-dump, or use an artifact-only detector "
+                         f"({', '.join(sorted(set(DUMP_DETECTORS) - {'differential', 'sifa'}))})")
+    c = np.array(rec["challenge"], float)
+    if detector == "structural":
+        return profile.structural_feature(c, resp)
+    return profile.feature(c, resp)
+
+
+def _feats_arts_from_records(profile, detector, records):
+    """Rebuild one site's (feats, arts) from its per-key dump records, so the shared
+    scoring path (`_score_and_pvalue`, `_sifa_feats`, `_ineffective_fraction`) runs
+    on dumped data exactly as on live-collected data."""
+    feats = {"A": [], "B": []}
+    arts = {"A": [], "B": []}
+    for key in ("A", "B"):
+        for rec in records.get(key, []):
+            arts[key].append(bytes.fromhex(rec["artifact"]))
+            feats[key].append(_feature_from_record(profile, detector, rec))
+    return feats, arts
+
+
+def _score_dump_row(site, label, feats, arts, golden, detector, profile, calibrate, n_perm):
+    """Score one reconstructed site into a `SiteResult` -- the scoring tail of
+    `_run_site`, shared so an offline row is identical to its live counterpart."""
+    if detector == "sifa":
+        metric, pvalue = _score_and_pvalue("sifa", _sifa_feats(arts, golden), profile,
+                                           calibrate, n_perm)
+    else:
+        golden_feats = golden["feats"] if golden else None
+        metric, pvalue = _score_and_pvalue(detector, feats, profile, calibrate, n_perm,
+                                            golden_feats)
+    status = _provisional_status(site, feats, metric, calibrate, detector, profile)
+    ran = len(feats["A"]) + len(feats["B"])
+    ineffective = None if site is None else _ineffective_fraction(
+        arts, golden["arts"] if golden else None)
+    return SiteResult(site, label, metric, status, ran, 0, pvalue=pvalue,
+                      ineffective=ineffective)
+
+
+def assess_from_dump(dump_dir, detector="two_key", calibrate=True, n_perm=DEFAULT_N_PERM,
+                     fdr_q=FDR_Q, correction="bh"):
+    """Re-run `detector` on a dumped sweep (`ucpqc.dump`) with NO emulator, returning
+    an `AssessmentResult` identical to a live `sweep_sites` with the same detector and
+    calibration -- the whole point of `--dump`: capture once, score any detector in
+    seconds.  `r0_reject` is not replayable (its data only exists under the
+    force-r0-accept path, which the skip sweep never captures)."""
+    from . import dump as dumpmod
+    from .profiles import profile_by_name
+    if detector == "r0_reject":
+        raise ValueError("r0_reject is not replayable from a skip-sweep dump (its data "
+                         "only exists under force-r0-accept); re-run it live")
+    meta, golden_records, site_dumps = dumpmod.load_dump(dump_dir)
+    profile = profile_by_name(meta["scheme"])
+
+    gfeats, garts = _feats_arts_from_records(profile, detector, golden_records)
+    rows = [_score_dump_row(None, "no fault (control)", gfeats, garts, None,
+                            detector, profile, calibrate, n_perm)]
+    golden = {"feats": gfeats, "arts": garts}     # baseline for every faulted site
+    for sd in site_dumps:
+        feats, arts = _feats_arts_from_records(profile, detector, sd)
+        rows.append(_score_dump_row(int(sd["addr"], 16), sd["label"], feats, arts, golden,
+                                    detector, profile, calibrate, n_perm))
+    if calibrate:
+        _apply_correction(rows, fdr_q, correction)
+    return AssessmentResult(meta["scheme"], "sweep", detector, meta["n"], rows,
+                            calibrate=calibrate, fdr_q=fdr_q, correction=correction,
+                            n_perm=n_perm, key_mode=meta.get("key_mode", "independent"))
 
 
 # --------------------------------------------------------------------------
