@@ -277,7 +277,22 @@ def cmd_sweep(args):
     result = assessmod.sweep_sites(scheme, profile, n=args.n, detector=args.detector,
                                    calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
                                    fdr_q=args.fdr, correction=args.correction,
-                                   key_mode=args.key_mode)
+                                   key_mode=args.key_mode, dump=args.dump)
+    rc = _emit(args, result)
+    if args.dump:
+        print(f"\ndumped golden + {len(result.rows) - 1} faulted sites to {args.dump}/ "
+              f"(replay offline with:  ucpqc detect {args.dump} --detector <name>)")
+    return rc
+
+
+def cmd_detect(args):
+    """Re-run a detector on a dumped sweep (`ucpqc.dump`) -- no emulator, no scheme
+    build.  Turns a `sweep --dump` capture into any detector's calibrated verdict in
+    seconds, so detectors can be compared without re-emulating."""
+    result = assessmod.assess_from_dump(args.dumpdir, detector=args.detector,
+                                        calibrate=not args.legacy_thresholds,
+                                        n_perm=args.n_perm, fdr_q=args.fdr,
+                                        correction=args.correction)
     return _emit(args, result)
 
 
@@ -313,6 +328,14 @@ def _add_calibration_flags(p):
     p.add_argument("--key-mode", default="independent", choices=("independent", "sibling"),
                    help="A/B keys: independent (default) or sibling (key B = key A with "
                         "one secret byte flipped -- a controlled minimal difference, #1)")
+    _add_scoring_flags(p)
+
+
+def _add_scoring_flags(p):
+    """Calibration knobs shared by the live sweeps AND the offline `detect` replay:
+    permutation count, FDR level, across-site correction, and the legacy opt-out.
+    (Unlike `--key-mode`, these are scoring-time choices, so `detect` re-exposes them
+    to re-score a dump at a different level without re-emulating.)"""
     p.add_argument("--n-perm", type=int, default=assessmod.DEFAULT_N_PERM, dest="n_perm",
                    help="permutation shuffles for the calibrated p-value (default %(default)s)")
     p.add_argument("--fdr", type=float, default=assessmod.FDR_Q,
@@ -442,8 +465,21 @@ def build_parser():
                             "differential", "sifa", "uniformity", "spec_aware", "r0_reject"))
     p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
     p.add_argument("--plot", help="directory to write the result bar chart into")
+    p.add_argument("--dump", nargs="?", const="dump", default=None, metavar="DIR",
+                   help="also write the golden + faulty runs (artifact + challenge per "
+                        "item) as JSON to DIR (default 'dump'), for offline replay with "
+                        "`ucpqc detect` -- no re-emulation")
     _add_calibration_flags(p)
     p.set_defaults(handler=cmd_sweep)
+
+    p = sub.add_parser("detect", help="re-run a detector on a dumped sweep "
+                       "(`sweep --dump`) offline -- no emulator")
+    p.add_argument("dumpdir", help="dump directory written by `sweep --dump`")
+    p.add_argument("--detector", default="two_key", choices=assessmod.DUMP_DETECTORS,
+                   help="detector to score the dump with (default two_key)")
+    p.add_argument("--plot", help="directory to write the result bar chart into")
+    _add_scoring_flags(p)
+    p.set_defaults(handler=cmd_detect)
 
     p = sub.add_parser("funcskip", help="instruction-skip sweep inside one function "
                        "(capture-and-replay)")
