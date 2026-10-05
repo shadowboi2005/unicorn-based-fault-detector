@@ -78,6 +78,8 @@ class _Cfg:
     backend: str = "call"
     calibrate: bool = True                # calibrated p-value + FDR verdict (vs legacy cutoffs)
     n_perm: int = DEFAULT_N_PERM
+    key_mode: str = "independent"
+    golden: object = None                 # control-row baseline, shared read-only by the threads
 
 
 # --------------------------------------------------------------------------
@@ -116,7 +118,7 @@ def _worker_init(cfg):
                                               cfg.seed, cfg.profile_override)
     # same order as assess.sweep_sites (keys then setup) so the clean state each
     # site is isolated to is byte-identical to the serial engine's
-    sk = {k: _assess._keypair(scheme, s)[1] for k, s in zip("AB", cfg.keys)}
+    sk = _assess._make_keys(scheme, cfg.keys, cfg.key_mode, profile)
     profile.setup(m)
     sites = dict(profile.fault_sites(m, _op_func(scheme)))
     if cfg.site_filter is not None:
@@ -124,17 +126,17 @@ def _worker_init(cfg):
     _tls.state = dict(scheme=scheme, profile=profile, sk=sk,
                       messages=_assess.standard_messages(cfg.n),
                       sites=sites, detector=cfg.detector, budget=cfg.budget,
-                      calibrate=cfg.calibrate, n_perm=cfg.n_perm)
+                      calibrate=cfg.calibrate, n_perm=cfg.n_perm, golden=cfg.golden)
 
 
 def _worker_run_site(site_addr):
-    """Per-task: run ONE site via the shared seam on this thread's machine."""
+    """Per-task: run ONE faulted site via the shared seam on this thread's machine."""
     st = _tls.state
-    label = ("no fault (control)" if site_addr is None
-             else st["sites"][site_addr])
-    return _assess._run_site(st["scheme"], st["profile"], st["sk"], st["messages"],
-                             site_addr, label, st["detector"], st["budget"],
-                             calibrate=st["calibrate"], n_perm=st["n_perm"])
+    row, _ = _assess._run_site(st["scheme"], st["profile"], st["sk"], st["messages"],
+                               site_addr, st["sites"][site_addr], st["detector"],
+                               st["budget"], calibrate=st["calibrate"],
+                               n_perm=st["n_perm"], golden=st["golden"])
+    return row
 
 
 def _enumerate_sites(cfg):
@@ -153,40 +155,54 @@ def _enumerate_sites(cfg):
     return name, ordered
 
 
+def _run_control(cfg):
+    """Run the control (unfaulted) row on the calling thread -> (control_row, golden);
+    golden is shared with the worker threads (in memory) as the ineffective /
+    differential / sifa baseline."""
+    m, scheme, profile = _build_bound_machine(cfg.elf_path, cfg.platform_name,
+                                              cfg.seed, cfg.profile_override)
+    sk = _assess._make_keys(scheme, cfg.keys, cfg.key_mode, profile)
+    profile.setup(m)
+    return _assess._run_site(scheme, profile, sk, _assess.standard_messages(cfg.n), None,
+                             "no fault (control)", cfg.detector, cfg.budget,
+                             calibrate=cfg.calibrate, n_perm=cfg.n_perm, golden=None)
+
+
 def sweep_sites_parallel(elf_path, platform_name="mps2-an386", keys=DEFAULT_KEYS,
                          n=DEFAULT_N, detector="two_key", budget=CAP, jobs=0,
                          seed=b"ucpqc", profile_override=None, site_filter=None,
                          progress=None, calibrate=True, n_perm=DEFAULT_N_PERM,
-                         fdr_q=FDR_Q, correction="bh"):
+                         fdr_q=FDR_Q, correction="bh", key_mode="independent"):
     """ThreadPool equivalent of `assess.sweep_sites`; bit-identical rows.
 
-    `jobs<=0` uses all CPUs.  `site_filter` restricts the sweep to those sites
-    (used by the parity test).  Rows are gathered as workers finish (dynamic
-    load-balancing for the uneven hang sites) and then re-ordered to the serial
-    control-first, addr-ascending order.  The calibrated verdict matches serial:
-    each worker returns a per-site p-value and the main thread runs the same
-    sweep-wide FDR pass once all rows are in."""
+    `jobs<=0` uses all CPUs.  `site_filter` restricts the sweep to those sites (used by
+    the parity test).  The control row runs first on the calling thread to produce the
+    golden baseline (shared via `cfg` across the threads); the faulted sites then run in
+    parallel, are gathered as they finish, re-imposed into serial control-first order,
+    and finalized by the same sweep-wide FDR pass as serial."""
     _warn_if_gil()
     cfg = _Cfg(elf_path, platform_name, keys, n, detector, budget, seed,
                profile_override, site_filter=site_filter,
-               calibrate=calibrate, n_perm=n_perm)
+               calibrate=calibrate, n_perm=n_perm, key_mode=key_mode)
     scheme_name, ordered = _enumerate_sites(cfg)
-    workers = resolve_jobs(jobs, len(ordered))
+    control_row, cfg.golden = _run_control(cfg)     # control first -> golden (shared via cfg)
+    faulted = [sl for sl in ordered if sl[0] is not None]
+    workers = resolve_jobs(jobs, len(faulted))
     by_addr = {}
     with ThreadPoolExecutor(max_workers=workers, initializer=_worker_init,
                             initargs=(cfg,)) as ex:
-        futs = {ex.submit(_worker_run_site, addr): addr for addr, _ in ordered}
+        futs = {ex.submit(_worker_run_site, addr): addr for addr, _ in faulted}
         for fut in as_completed(futs):
             row = fut.result()
             by_addr[row.addr] = row
             if progress:
                 progress(row)               # arrives out of order; that's fine
-    rows = [by_addr[addr] for addr, _ in ordered]   # re-impose serial order
+    rows = [control_row] + [by_addr[addr] for addr, _ in faulted]
     if calibrate:                                   # same sweep-wide FDR pass as serial
         _assess._apply_correction(rows, fdr_q, correction)
     return AssessmentResult(scheme_name, "sweep", detector, n, rows,
                             calibrate=calibrate, fdr_q=fdr_q, correction=correction,
-                            n_perm=n_perm)
+                            n_perm=n_perm, key_mode=key_mode)
 
 
 # --------------------------------------------------------------------------
