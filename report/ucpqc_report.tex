@@ -692,6 +692,31 @@ constraint: \code{numpy}/\code{scipy}/\code{sympy} are fine, whereas \code{numba
 \section{Results}\label{sec:results}
 %======================================================================
 
+Table~\ref{tab:detections} is the one-line detection log --- every leak the
+framework \textbf{flagged} (and the notable ones it deliberately does not), with the
+test inputs and the detection method for each. The subsections that follow expand
+each row; the detection log itself is maintained in \code{examples/DETECTIONS.md}.
+
+\begin{table}[h]
+\centering\footnotesize
+\caption{Detection log: what was flagged, on what inputs, by which detector
+(\code{examples/DETECTIONS.md}).}
+\label{tab:detections}
+\begin{tabular}{@{}p{1.1cm}p{2.9cm}p{3.0cm}p{1.7cm}p{2.0cm}p{2.1cm}@{}}
+\toprule
+Scheme & Site / fault & Inputs & Detector & Metric & Verdict \\
+\midrule
+ML-DSA & \code{z=z+y} skip (\code{bl polyvecl\_add}) & 2 keys $\times$ N, matched filter$(c,z)$ & \code{two\_key} & 100\% & \textbf{LEAK} \\
+ML-DSA & same, field-aware & 2 keys $\times$ N, $s_1$ over \Zq & \code{structural} & 0.917 & \textbf{LEAK} \\
+ML-DSA & \code{mov r7,r0} (out ptr) & funcskip isolated replay & \code{two\_key} & 100\% iso / 69\% e2e & artifact \\
+ML-DSA & r0-check forced accept & raw coeffs $+$ bound & \code{spec\_aware} & \code{band\_count}${>}0$ & \textbf{LEAK} (ex.\,08) \\
+ML-DSA & \code{poly\_chknorm} skip & --- & \code{two\_key} & --- & crash/hang \\
+MAYO & any sweep site & 2 keys $\times$ N, raw bytes & \code{two\_key} & ${\leq}54\%$ & none (control 46\%) \\
+MAYO & de-inlined \code{mat\_add} eor-skip & funcskip, \GF{16} & all & ${\leq}57\%$ / 0.0 & none (needs data fault) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsection{Dilithium: the mask-removal leak (mode \code{sweep})}
 Across the auto-discovered signing-loop sites, exactly one leaks: the masking add
 $z=z+y$ (\code{bl polyvecl\_add}, \code{0x4d5e}), at \textbf{100\%} two-key accuracy;
