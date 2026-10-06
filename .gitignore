@@ -10,3 +10,9 @@ firmware/*.bin
 # analysis output
 *.npy
 *.csv
+
+# fault-analysis dumps (sweep --dump / funcskip --dump); generated data, not source
+/dump/
+/dumps/
+*_instrskip/
+funcskip_sweep/
