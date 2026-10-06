@@ -421,20 +421,25 @@ diagonal, and full covariance respectively, and \code{structural} is that same i
 over the scheme's own finite field.
 
 \begin{table}[h]
-\centering\small
-\caption{The detector repertoire (\code{detectors.py}).}
+\centering\footnotesize
+\caption{The detector catalog (\code{detectors.py}, mirroring
+\code{examples/DETECTIONS.md}): the feature each detector consumes, its statistic and
+legacy fixed cutoff, how the calibrated verdict is obtained, and what it catches.
+\code{two\_key} is the default detector; \code{per\_coord} (TVLA) is now the sweep default.}
 \label{tab:detectors}
-\begin{tabular}{@{}p{2.3cm}p{4.4cm}p{5.6cm}@{}}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{2.1cm}>{\raggedright\arraybackslash}p{2.7cm}>{\raggedright\arraybackslash}p{3.0cm}>{\raggedright\arraybackslash}p{2.3cm}>{\raggedright\arraybackslash}p{2.8cm}@{}}
 \toprule
-Detector & Statistic & Catches \\
+Detector & Feature consumed & Statistic $\cdot$ legacy cutoff & Calibrated by & Catches \\
 \midrule
-\code{two\_key}   & LOO nearest-mean accuracy on the matched filter & whole-output mean shift by key \\
-\code{per\_coord} & max $|$Welch $t|$ over $D$ coords (TVLA)       & leak in a single output position \\
-\code{subspace}   & covariance-whitened (LDA) LOO accuracy         & leak in a correlated subspace \\
-\code{structural} & field-rank collapse over \Zq/\GF{16}           & algebraic accumulation / recoverability \\
-\code{mmd}        & kernel two-sample MMD$^2$                      & any distributional shift by key \\
-\code{uniformity} & largest histogram-bin share ($\chi^2$)         & a biased nonce (loop abort) \\
-\code{spec\_aware}& count of coeffs $\geq$ reject bound            & a rejection-boundary bypass \\
+\code{two\_key}   & matched filter of $c$ against $z$ (or raw bytes) & LOO nearest-mean accuracy $\cdot \geq 80\%$ & permutation $p$ & whole-output \textbf{mean shift} by key \\
+\code{per\_coord} & same feature & $\max|t|$ (Welch) over coords $\cdot \geq$ Bonferroni ($\sim$5.3) & analytic (Bonferroni normal tail) & leak in \textbf{one output position} \\
+\code{subspace}   & same feature & covariance-whitened (LDA) LOO acc.\ $\cdot \geq 80\%$ & permutation $p$ & leak in a \textbf{correlated subspace} \\
+\code{structural} & \textbf{field elements} (\Zq\,/\,\GF{16}) & rank-collapse score (collapse $\cdot$ sep.) $\cdot \geq 0.5$ & permutation $p$ (sharp; null $\approx 0$) & \textbf{accumulation / recoverability} \\
+\code{mmd}        & same feature & kernel two-sample MMD$^2$ & permutation $p$ & any \textbf{distributional} shift by key \\
+\code{differential} & raw $z$ $+$ \textbf{golden} baseline & $|t|$ of per-item change magnitude between keys $\cdot \gtrsim 2.6$ & analytic (normal tail) & a \textbf{key-dependent fault effect} \\
+\code{uniformity} & raw nonce coefficients & largest histogram bin share $\cdot > 10\%$ & analytic ($\chi^2$ tail) & a \textbf{biased nonce} (loop abort) \\
+\code{spec\_aware}& raw coeffs $+$ \code{reject\_bound} & count of coeffs $\geq$ bound $\cdot > 0$ & deterministic ($p{=}0$ if ${>}0$) & a \textbf{rejection-boundary bypass} \\
+\code{r0\_reject} & captured accepted \code{r0} $+$ bound & share of sigs.\ with out-of-spec \code{r0} $\cdot > 0$ & deterministic & \textbf{r0 rejection} / Finding-a-Polytope \\
 \bottomrule
 \end{tabular}
 \end{table}
