@@ -144,7 +144,7 @@ def _run_control(elf_path, platform_name, keys, n, detector, budget, seed,
 
 
 def sweep_sites_parallel(elf_path, platform_name="mps2-an386", keys=DEFAULT_KEYS,
-                         n=DEFAULT_N, detector="two_key", budget=CAP, jobs=0,
+                         n=DEFAULT_N, detector="per_coord", budget=CAP, jobs=0,
                          seed=b"ucpqc", profile_override=None, site_filter=None,
                          progress=None, calibrate=True, n_perm=DEFAULT_N_PERM,
                          fdr_q=FDR_Q, correction="bh", key_mode="independent"):
