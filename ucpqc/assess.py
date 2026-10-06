@@ -672,17 +672,32 @@ def _capture_funcskip(scheme, profile, target, backend, keys, n, key_mode="indep
     return {k: capture(k) for k in ("A", "B")}
 
 
+def _funcskip_feature(profile, detector, cap_c, out):
+    """One funcskip feature from a (possibly faulted) function output `out` and the
+    per-item challenge `cap_c`.  Robust to any output shape: a polyvecl buffer decodes
+    via the profile, so the challenge-aware matched filter / structural feature apply
+    (preserving the default two_key / uniformity behaviour on polyvecl_add and the y
+    sampler); any other buffer is unpacked as raw int32, and a scalar return value
+    becomes a 1-vector -- so new targets (poly_challenge, ntt, poly_chknorm) featurize
+    without a per-target decoder."""
+    if isinstance(out, (bytes, bytearray)):
+        try:
+            resp, shaped = profile.response_from_output(bytes(out)), True   # polyvecl -> (L, N)
+        except Exception:
+            resp, shaped = np.frombuffer(bytes(out), dtype="<i4").astype(float), False
+    else:                                              # a scalar return value (out == "ret")
+        resp, shaped = np.array([float(out)]), False
+    if shaped and cap_c is not None and detector in ("two_key", "per_coord", "subspace"):
+        return profile.feature(cap_c, resp)
+    if shaped and cap_c is not None and detector == "structural":
+        return profile.structural_feature(cap_c, resp)
+    return np.asarray(resp, float).ravel()             # uniformity / spec_aware / non-polyvecl
+
+
 def _make_featurize(profile, detector):
     """Build the funcskip featurizer (shared by serial + parallel)."""
     def featurize(cap, out):
-        resp = profile.response_from_output(out)
-        # two_key / per_coord / subspace are different classifiers over the SAME
-        # (challenge-aware) feature; only the raw-coefficient detectors bypass it.
-        if detector in ("two_key", "per_coord", "subspace"):
-            return profile.feature(cap.c, resp)
-        if detector == "structural":
-            return profile.structural_feature(cap.c, resp)
-        return resp.ravel()                            # uniformity / spec_aware
+        return _funcskip_feature(profile, detector, getattr(cap, "c", None), out)
     return featurize
 
 
@@ -699,15 +714,36 @@ def _make_detect(profile, detector, calibrate, n_perm):
     return detect
 
 
+class _FuncskipDumpSink:
+    """Collects the per-skip-site faulted outputs as `--dump` replays them:
+    ``pc -> {pc, text, A:[{idx,out}], B:[...]}`` (``out`` = output buffer hex, or the
+    int return value), keyed to the capture index so the offline featurizer can pair
+    each output with its item's challenge."""
+    def __init__(self):
+        self._sites = {}
+
+    def record(self, pc, text, key, cap_i, out):
+        s = self._sites.setdefault(pc, {"pc": hex(pc), "text": text, "A": [], "B": []})
+        val = out.hex() if isinstance(out, (bytes, bytearray)) else int(out)
+        s[key].append({"idx": cap_i, "out": val})
+
+    def sites(self):
+        return [self._sites[pc] for pc in sorted(self._sites)]
+
+
 def sweep_function(scheme, profile, target=None, keys=DEFAULT_KEYS, n=DEFAULT_N,
                    detector=None, backend="call", budget=5_000_000, progress=None,
                    calibrate=True, n_perm=DEFAULT_N_PERM, fdr_q=FDR_Q, correction="bh",
-                   key_mode="independent"):
+                   key_mode="independent", dump=None):
     """Capture one function's I/O across N signings per key, then replay it under
     an instruction skip at every interior site and score the leak.  `target` is a
     `replay.Target` (defaults to `profile.default_target()`).  Verdict is calibrated
     by default (per-site p-value + sweep-wide FDR `fdr_q`); `calibrate=False` uses
-    the legacy fixed cutoffs.  Returns an `AssessmentResult`."""
+    the legacy fixed cutoffs.  Returns an `AssessmentResult`.
+
+    `dump` (a directory path): also write the per-item challenge and every skip site's
+    faulted outputs there (`ucpqc.dump`), so the detectors can be re-run offline
+    (`assess_funcskip_from_dump`) without re-capturing/replaying."""
     m = scheme.machine
     target = target or profile.default_target()
     detector = detector or profile.detector_for(target)
@@ -715,8 +751,10 @@ def sweep_function(scheme, profile, target=None, keys=DEFAULT_KEYS, n=DEFAULT_N,
     featurize = _make_featurize(profile, detector)
     detect = _make_detect(profile, detector, calibrate, n_perm)
 
+    sink = _FuncskipDumpSink() if dump else None
     swept = skip_sweep(m, target, caps_by_key, featurize, detect,
-                       backend=backend, persistent=True, budget=budget)
+                       backend=backend, persistent=True, budget=budget,
+                       on_output=(sink.record if sink else None))
     rows = []
     for r in swept:
         metric, pvalue = r.get("metric"), r.get("pvalue")
@@ -733,6 +771,56 @@ def sweep_function(scheme, profile, target=None, keys=DEFAULT_KEYS, n=DEFAULT_N,
             progress(row)
     if calibrate:
         _apply_correction(rows, fdr_q, correction)
+    if dump:
+        from . import dump as dumpmod
+        sites = sink.sites()
+        meta = {"scheme": scheme.name, "mode": "funcskip",
+                "target": getattr(target, "name", str(target)),
+                "label": getattr(target, "label", ""),
+                "detector": detector, "n": n, "key_mode": key_mode, "backend": backend,
+                "out_kind": "ret" if target.out == "ret" else "buffer",
+                "sites": [{"pc": s["pc"], "text": s["text"]} for s in sites]}
+        caps = {k: [[int(x) for x in c.c] for c in caps_by_key.get(k, [])] for k in ("A", "B")}
+        dumpmod.write_funcskip_dump(dump, meta, caps, sites)
     return AssessmentResult(scheme.name, "funcskip", detector, n, rows,
                             calibrate=calibrate, fdr_q=fdr_q, correction=correction,
                             n_perm=n_perm, key_mode=key_mode)
+
+
+def assess_funcskip_from_dump(dump_dir, detector=None, calibrate=True,
+                              n_perm=DEFAULT_N_PERM, fdr_q=FDR_Q, correction="bh"):
+    """Re-score a funcskip dump (`sweep_function(dump=...)`) offline, no emulator:
+    reconstruct each skip site's per-key features from the dumped outputs + challenges
+    and score `detector` (default: the dump's own), returning an `AssessmentResult`
+    identical to the live funcskip run."""
+    from . import dump as dumpmod
+    from .profiles import profile_by_name
+    meta, caps, sites = dumpmod.load_funcskip_dump(dump_dir)
+    profile = profile_by_name(meta["scheme"])
+    detector = detector or meta["detector"]
+    buffer = meta.get("out_kind", "buffer") == "buffer"
+    caps_c = {k: [np.array(c, float) for c in caps.get(k, [])] for k in ("A", "B")}
+
+    rows = []
+    for sd in sites:
+        feats = {"A": [], "B": []}
+        for k in ("A", "B"):
+            for rec in sd.get(k, []):
+                out = bytes.fromhex(rec["out"]) if buffer else int(rec["out"])
+                cc = caps_c[k][rec["idx"]] if rec["idx"] < len(caps_c[k]) else None
+                feats[k].append(_funcskip_feature(profile, detector, cc, out))
+        metric, pvalue = _score_and_pvalue(detector, feats, profile, calibrate, n_perm)
+        ran = len(feats["A"]) + len(feats["B"])
+        if ran < 3 or metric is None:
+            status = "crash"
+        elif not calibrate:
+            status = "LEAK" if _legacy_leak(detector, metric, feats, profile) else "ok"
+        else:
+            status = "pending"
+        rows.append(SiteResult(int(sd["pc"], 16), sd["text"], metric, status, ran, 0,
+                               pvalue=pvalue))
+    if calibrate:
+        _apply_correction(rows, fdr_q, correction)
+    return AssessmentResult(meta["scheme"], "funcskip", detector, meta["n"], rows,
+                            calibrate=calibrate, fdr_q=fdr_q, correction=correction,
+                            n_perm=n_perm, key_mode=meta.get("key_mode", "independent"))

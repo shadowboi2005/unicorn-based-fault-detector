@@ -286,13 +286,22 @@ def cmd_sweep(args):
 
 
 def cmd_detect(args):
-    """Re-run a detector on a dumped sweep (`ucpqc.dump`) -- no emulator, no scheme
-    build.  Turns a `sweep --dump` capture into any detector's calibrated verdict in
-    seconds, so detectors can be compared without re-emulating."""
-    result = assessmod.assess_from_dump(args.dumpdir, detector=args.detector,
-                                        calibrate=not args.legacy_thresholds,
-                                        n_perm=args.n_perm, fdr_q=args.fdr,
-                                        correction=args.correction)
+    """Re-run a detector on a dumped sweep or funcskip capture (`ucpqc.dump`) -- no
+    emulator, no scheme build.  Dispatches on the dump's mode, so both a `sweep --dump`
+    and a `funcskip --dump` directory replay any detector's calibrated verdict in
+    seconds, without re-emulating."""
+    import json
+    meta = json.load(open(os.path.join(args.dumpdir, "meta.json")))
+    if meta.get("mode") == "funcskip":
+        result = assessmod.assess_funcskip_from_dump(
+            args.dumpdir, detector=args.detector,
+            calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
+            fdr_q=args.fdr, correction=args.correction)
+    else:
+        result = assessmod.assess_from_dump(
+            args.dumpdir, detector=args.detector or "per_coord",
+            calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
+            fdr_q=args.fdr, correction=args.correction)
     return _emit(args, result)
 
 
@@ -307,12 +316,19 @@ def cmd_funcskip(args):
             raise SystemExit(f"unknown --target {args.target!r}; "
                              f"known: {', '.join(sorted(targets)) or 'none'}")
         target = targets[args.target]
+    dump_dir = getattr(args, "dump", None)
+    if dump_dir == "__auto__":                    # `--dump` with no value -> <target>_instrskip
+        dump_dir = f"{args.target or 'funcskip'}_instrskip"
     result = assessmod.sweep_function(scheme, profile, target=target, n=args.n,
                                       detector=args.detector, backend=args.backend,
                                       calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
                                       fdr_q=args.fdr, correction=args.correction,
-                                      key_mode=args.key_mode)
-    return _emit(args, result)
+                                      key_mode=args.key_mode, dump=dump_dir)
+    rc = _emit(args, result)
+    if dump_dir:
+        print(f"\ndumped {len(result.rows)} skip sites to {dump_dir}/ "
+              f"(replay offline with:  ucpqc detect {dump_dir})")
+    return rc
 
 
 # --- argument parsing -------------------------------------------------------
@@ -472,11 +488,12 @@ def build_parser():
     _add_calibration_flags(p)
     p.set_defaults(handler=cmd_sweep)
 
-    p = sub.add_parser("detect", help="re-run a detector on a dumped sweep "
-                       "(`sweep --dump`) offline -- no emulator")
-    p.add_argument("dumpdir", help="dump directory written by `sweep --dump`")
-    p.add_argument("--detector", default="per_coord", choices=assessmod.DUMP_DETECTORS,
-                   help="detector to score the dump with (default per_coord/TVLA)")
+    p = sub.add_parser("detect", help="re-run a detector on a dumped sweep or funcskip "
+                       "capture (`--dump`) offline -- no emulator")
+    p.add_argument("dumpdir", help="dump directory written by `sweep --dump` or `funcskip --dump`")
+    p.add_argument("--detector", default=None, choices=assessmod.DUMP_DETECTORS,
+                   help="detector to score the dump with (default: per_coord/TVLA for a "
+                        "sweep dump, the captured detector for a funcskip dump)")
     p.add_argument("--plot", help="directory to write the result bar chart into")
     _add_scoring_flags(p)
     p.set_defaults(handler=cmd_detect)
@@ -493,6 +510,10 @@ def build_parser():
     p.add_argument("--backend", default="call", choices=("call", "snapshot"))
     p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
     p.add_argument("--plot", help="directory to write the result bar chart into")
+    p.add_argument("--dump", nargs="?", const="__auto__", default=None, metavar="DIR",
+                   help="also write per-item challenge + every skip site's faulted outputs "
+                        "to DIR (default <target>_instrskip/), for offline replay with "
+                        "`ucpqc detect` -- no re-capture")
     _add_calibration_flags(p)
     p.set_defaults(handler=cmd_funcskip)
 

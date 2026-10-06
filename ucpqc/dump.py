@@ -50,6 +50,35 @@ def load_dump(dump_dir):
     return meta, golden, sites
 
 
+CAPS = "caps.json"
+
+
+def write_funcskip_dump(dump_dir, meta, caps, sites):
+    """Write a funcskip (instruction-skip) dump: ``meta`` (dict, mode=``funcskip``),
+    ``caps`` ({key: [challenge, ...]} -- the per-item challenge each output pairs with),
+    and one ``site_<pc>.json`` per skip site (``{pc, text, A:[{idx,out}], B:[...]}``,
+    ``out`` = output buffer hex or the int return value).  Returns ``dump_dir``."""
+    os.makedirs(dump_dir, exist_ok=True)
+    _write(os.path.join(dump_dir, MANIFEST), meta)
+    _write(os.path.join(dump_dir, CAPS), caps)
+    for s in sites:
+        _write(os.path.join(dump_dir, f"site_{s['pc']}.json"), s)
+    return dump_dir
+
+
+def load_funcskip_dump(dump_dir):
+    """Inverse of :func:`write_funcskip_dump`: ``(meta, caps, sites)`` in
+    ``meta['sites']`` order (missing files skipped)."""
+    meta = _read(os.path.join(dump_dir, MANIFEST))
+    caps = _read(os.path.join(dump_dir, CAPS))
+    sites = []
+    for entry in meta.get("sites", []):
+        path = os.path.join(dump_dir, f"site_{entry['pc']}.json")
+        if os.path.exists(path):
+            sites.append(_read(path))
+    return meta, caps, sites
+
+
 def _write(path, obj):
     with open(path, "w") as fh:
         json.dump(obj, fh)

@@ -28,6 +28,7 @@ CTILDE_BYTES = 32
 POLYZ_BYTES = N_COEFFS * 18 // 8
 SIGLEN = CTILDE_BYTES + POLYZ_BYTES * L + 84
 POLYVECL_BYTES = L * N_COEFFS * 4
+POLY_BYTES = N_COEFFS * 4                     # one polynomial, 256 int32 coefficients
 R0_BOUND = GAMMA2 - BETA                     # gamma2 - beta, the r0 reject bound
 
 
@@ -184,6 +185,16 @@ class MLDSAProfile(AnalysisProfile):
                                 nth=-1, args=(("out", POLYVECL_BYTES), ("in", 64),
                                               "scalar"), out=0,
                                 label="polyvecl_uniform_gamma1 (y)"),
+            # --- paper-leaky targets for per-function instruction-skip dumps ---
+            "poly_challenge": Target(func="pqcrystals_dilithium_poly_challenge", nth=-1,
+                                     args=(("out", POLY_BYTES), ("in", CTILDE_BYTES)), out=0,
+                                     label="poly_challenge (SampleInBall -> c)"),
+            "ntt": Target(func="pqcrystals_dilithium_ntt", nth=-1,
+                          args=(("in", POLY_BYTES),), out=0,
+                          label="ntt (in-place, c*s1 domain)"),
+            "poly_chknorm": Target(func="pqcrystals_dilithium_poly_chknorm", nth=-1,
+                                   args=(("in", POLY_BYTES), "scalar"), out="ret",
+                                   label="poly_chknorm (rejection check)"),
         }
 
     def default_target(self):

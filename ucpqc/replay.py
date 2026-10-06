@@ -301,23 +301,27 @@ def _skip_sites(machine, target, stride=1, persistent=False):
 
 
 def _replay_site(machine, target, spec, captures_by_key, featurize, detect,
-                 backend, budget):
+                 backend, budget, on_output=None):
     """Replay every capture under one skip `spec`, featurize the survivors, and
     score the populations -> one row dict {'pc','text','crashed','ran',**detect}.
 
     The reusable per-site seam of `skip_sweep`; deterministic given the captures,
-    so a parallel driver can call it against a shipped `captures_by_key`."""
+    so a parallel driver can call it against a shipped `captures_by_key`.
+    `on_output(pc, text, key, cap_index, output)`, if given, is called for every
+    surviving faulted output (before featurizing) -- the seam `--dump` records."""
     keys = list(captures_by_key)
     _, _, text = machine.disasm_one(spec.pc)
     feats = {k: [] for k in keys}
     crashed = ran = 0
     for k in keys:
-        for cap in captures_by_key[k]:
+        for cap_i, cap in enumerate(captures_by_key[k]):
             out = replay(machine, target, cap, spec, backend, budget)
             if out is None:
                 crashed += 1
             else:
                 ran += 1
+                if on_output is not None:
+                    on_output(spec.pc, text, k, cap_i, out)
                 feats[k].append(featurize(cap, out))
     row = {"pc": spec.pc, "text": text, "crashed": crashed, "ran": ran}
     try:
@@ -329,7 +333,7 @@ def _replay_site(machine, target, spec, captures_by_key, featurize, detect,
 
 def skip_sweep(machine, target, captures_by_key, featurize, detect,
                backend="snapshot", stride=1, persistent=False,
-               budget=5_000_000, progress=None):
+               budget=5_000_000, progress=None, on_output=None):
     """For each instruction-skip site in the target, replay every capture,
     turn each faulted output into a feature vector, and score the two
     populations.
@@ -347,7 +351,7 @@ def skip_sweep(machine, target, captures_by_key, featurize, detect,
     try:
         for spec in _skip_sites(machine, target, stride, persistent):
             row = _replay_site(machine, target, spec, captures_by_key,
-                               featurize, detect, backend, budget)
+                               featurize, detect, backend, budget, on_output)
             results.append(row)
             if progress:
                 progress(row)

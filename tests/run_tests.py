@@ -650,6 +650,32 @@ def test_detect_reuses_dump():
         pass
 
 
+def test_funcskip_dump_matches_live():
+    """`funcskip --dump` + offline `assess_funcskip_from_dump` reproduces the live
+    funcskip verdict: every scored (survivor) skip site agrees on metric/p/status.
+    (All-crash sites produce no output and are legitimately absent from the dump.)"""
+    import tempfile
+    from ucpqc import assess
+    from ucpqc.profiles import profile_for
+    _, scheme = booted()
+    scheme.machine.stub_cycle_counter()
+    prof = profile_for(scheme)
+    d = tempfile.mkdtemp(prefix="ucpqc-fsk-")
+    live = assess.sweep_function(scheme, prof, target=prof.targets()["polyvecl_add"],
+                                 n=6, dump=d)
+    off = assess.assess_funcskip_from_dump(d)
+    assert off.mode == "funcskip" and off.detector == live.detector
+    lv = {r.addr: r for r in live.rows}
+    ov = {r.addr: r for r in off.rows}
+    assert set(ov) <= set(lv), "offline sites are a subset of live"
+    assert all(lv[a].status == "crash" for a in set(lv) - set(ov)), \
+        "live-only sites are all-crash (no outputs to dump)"
+    for a in set(lv) & set(ov):
+        assert (lv[a].metric, lv[a].pvalue, lv[a].status) == \
+               (ov[a].metric, ov[a].pvalue, ov[a].status), f"row mismatch at {a:#x}"
+    assert {r.addr for r in live.leaks()} == {r.addr for r in off.leaks()}
+
+
 # --- runner -----------------------------------------------------------------
 
 
