@@ -34,5 +34,5 @@ m = Machine.from_elf(ELF)
 scheme = Scheme.bind(m)
 m.boot()
 
-result = assess.sweep_sites(scheme, profile_for(scheme), n=N)
+result = assess.sweep_sites(scheme, profile_for(scheme), n=N, detector="two_key")
 print(report.format_table(result))

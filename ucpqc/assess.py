@@ -484,7 +484,7 @@ def _run_site(scheme, profile, sk, messages, site, label, detector, budget,
 
 
 def sweep_sites(scheme, profile, keys=DEFAULT_KEYS, n=DEFAULT_N,
-                detector="two_key", budget=CAP, progress=None,
+                detector="per_coord", budget=CAP, progress=None,
                 calibrate=True, n_perm=DEFAULT_N_PERM, fdr_q=FDR_Q, correction="bh",
                 key_mode="independent", dump=None):
     """Sweep every fault site from `profile.fault_sites`, re-running the operation
@@ -609,7 +609,7 @@ def _score_dump_row(site, label, feats, arts, golden, detector, profile, calibra
                       ineffective=ineffective)
 
 
-def assess_from_dump(dump_dir, detector="two_key", calibrate=True, n_perm=DEFAULT_N_PERM,
+def assess_from_dump(dump_dir, detector="per_coord", calibrate=True, n_perm=DEFAULT_N_PERM,
                      fdr_q=FDR_Q, correction="bh"):
     """Re-run `detector` on a dumped sweep (`ucpqc.dump`) with NO emulator, returning
     an `AssessmentResult` identical to a live `sweep_sites` with the same detector and
