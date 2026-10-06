@@ -307,6 +307,21 @@ def cmd_detect(args):
 
 def cmd_funcskip(args):
     """Instruction-skip sweep inside one function, via capture-and-replay."""
+    dump_dir = getattr(args, "dump", None)
+    if dump_dir == "__auto__":                    # `--dump` with no value -> <target>_instrskip
+        dump_dir = f"{args.target or 'funcskip'}_instrskip"
+    if getattr(args, "jobs", 1) != 1:             # multithreaded path (free-threaded 3.14t)
+        from . import parallel_funcskip as pf
+        result = pf.sweep_function_dump_parallel(
+            args.elf, args.target, platform_name=args.platform, n=args.n, jobs=args.jobs,
+            key_mode=args.key_mode, profile_override=getattr(args, "profile", None),
+            detector=args.detector, calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
+            fdr_q=args.fdr, correction=args.correction, dump_dir=dump_dir)
+        rc = _emit(args, result)
+        if dump_dir:
+            print(f"\ndumped {len(result.rows)} skip sites to {dump_dir}/ "
+                  f"(replay offline with:  ucpqc detect {dump_dir})")
+        return rc
     m, scheme = _machine(args)
     profile = _profile(args, scheme)
     target = None
@@ -316,9 +331,6 @@ def cmd_funcskip(args):
             raise SystemExit(f"unknown --target {args.target!r}; "
                              f"known: {', '.join(sorted(targets)) or 'none'}")
         target = targets[args.target]
-    dump_dir = getattr(args, "dump", None)
-    if dump_dir == "__auto__":                    # `--dump` with no value -> <target>_instrskip
-        dump_dir = f"{args.target or 'funcskip'}_instrskip"
     result = assessmod.sweep_function(scheme, profile, target=target, n=args.n,
                                       detector=args.detector, backend=args.backend,
                                       calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
@@ -508,6 +520,9 @@ def build_parser():
                             "mmd", "uniformity", "spec_aware"),
                    help="override the profile's detector for the target")
     p.add_argument("--backend", default="call", choices=("call", "snapshot"))
+    p.add_argument("-j", "--jobs", type=int, default=1,
+                   help="worker threads (1=serial; >1 parallelizes capture + replay, "
+                        "best on the free-threaded 3.14t interpreter)")
     p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
     p.add_argument("--plot", help="directory to write the result bar chart into")
     p.add_argument("--dump", nargs="?", const="__auto__", default=None, metavar="DIR",

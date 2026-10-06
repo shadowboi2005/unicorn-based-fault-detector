@@ -676,6 +676,21 @@ def test_funcskip_dump_matches_live():
     assert {r.addr for r in live.leaks()} == {r.addr for r in off.leaks()}
 
 
+def test_funcskip_parallel_jobs_invariant():
+    """The multithreaded funcskip dump is jobs-invariant: jobs=1 and jobs=2 give the
+    identical per-site verdict (each signing is an independent snapshot-isolated,
+    per-index-seeded unit of work).  (Real parallelism needs 3.14t; on a GIL build
+    this still verifies correctness, just serially.)"""
+    from ucpqc.parallel_funcskip import sweep_function_dump_parallel as P
+    need(DILITHIUM)
+    r1 = P(DILITHIUM, "polyvecl_add", n=8, jobs=1)
+    r2 = P(DILITHIUM, "polyvecl_add", n=8, jobs=2)
+    v1 = {row.addr: (row.metric, row.pvalue, row.status) for row in r1.rows}
+    v2 = {row.addr: (row.metric, row.pvalue, row.status) for row in r2.rows}
+    assert v1 == v2, "jobs=1 and jobs=2 must produce identical verdicts"
+    assert r1.mode == "funcskip" and len(r1.rows) >= 5
+
+
 # --- runner -----------------------------------------------------------------
 
 
