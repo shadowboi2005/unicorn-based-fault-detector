@@ -460,7 +460,7 @@ def build_parser():
                        "(ALAFA-style two-key leak test)")
     add_elf(p)
     p.add_argument("--n", type=int, default=24, help="signatures per key")
-    p.add_argument("--detector", default="two_key",
+    p.add_argument("--detector", default="per_coord",
                    choices=("two_key", "per_coord", "subspace", "structural", "mmd",
                             "differential", "sifa", "uniformity", "spec_aware", "r0_reject"))
     p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
@@ -475,8 +475,8 @@ def build_parser():
     p = sub.add_parser("detect", help="re-run a detector on a dumped sweep "
                        "(`sweep --dump`) offline -- no emulator")
     p.add_argument("dumpdir", help="dump directory written by `sweep --dump`")
-    p.add_argument("--detector", default="two_key", choices=assessmod.DUMP_DETECTORS,
-                   help="detector to score the dump with (default two_key)")
+    p.add_argument("--detector", default="per_coord", choices=assessmod.DUMP_DETECTORS,
+                   help="detector to score the dump with (default per_coord/TVLA)")
     p.add_argument("--plot", help="directory to write the result bar chart into")
     _add_scoring_flags(p)
     p.set_defaults(handler=cmd_detect)
