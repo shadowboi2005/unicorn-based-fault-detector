@@ -707,7 +707,7 @@ each row; the detection log itself is maintained in \code{examples/DETECTIONS.md
 \caption{Detection log: what was flagged, on what inputs, by which detector
 (\code{examples/DETECTIONS.md}).}
 \label{tab:detections}
-\begin{tabular}{@{}p{1.1cm}p{2.9cm}p{3.0cm}p{1.7cm}p{2.0cm}p{2.1cm}@{}}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{1.1cm}>{\raggedright\arraybackslash}p{2.9cm}>{\raggedright\arraybackslash}p{2.8cm}>{\raggedright\arraybackslash}p{1.7cm}>{\raggedright\arraybackslash}p{2.2cm}>{\raggedright\arraybackslash}p{2.1cm}@{}}
 \toprule
 Scheme & Site / fault & Inputs & Detector & Metric & Verdict \\
 \midrule
@@ -837,6 +837,42 @@ The 32-test system suite passes on both standard CPython 3.12 and free-threaded
 hand-rolled \Zq{} and \GF{16} ranks against a trusted library. The calibration
 change preserved every known verdict (the two \code{funcskip} sites, the ALAFA leak)
 while removing the small-$N$ false positives.
+
+\subsection{Positives and negatives, and the attacks they map to}\label{sec:posneg}
+Table~\ref{tab:posneg} classifies the findings as \emph{positives} (a leak flagged)
+or \emph{negatives} (nothing flagged), and names the published attack each positive
+corresponds to --- so a detection reads as evidence for a concrete, documented fault
+rather than an abstract score. The negatives are kept deliberately: a detector
+framework earns trust from its honest misses as much as its hits. References are the
+footnotes in Sections~\ref{sec:detectors}--\ref{sec:whysignal}.
+
+\begin{table}[h]
+\centering\footnotesize
+\caption{Positives (a real leak flagged, with the corresponding published attack) and
+negatives (nothing flagged, with the reason).}
+\label{tab:posneg}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{3.5cm}>{\raggedright\arraybackslash}p{3.1cm}>{\raggedright\arraybackslash}p{5.1cm}@{}}
+\toprule
+Observation (site / fault) & Detector $\cdot$ result & Corresponding attack / reason \\
+\midrule
+\multicolumn{3}{@{}l}{\textbf{Positives --- a real leak, flagged}}\\
+\addlinespace[2pt]
+Mask removal $z=c\,s_1$ (skip \code{polyvecl\_add}) & \code{two\_key} 100\%, \code{structural} 0.92, \code{per\_coord} $|t|{=}12.9$ & ``Exploiting Determinism'' (Ravi \emph{et al.}); loop-abort (Espitau \emph{et al.}, SAC'16); Diff.\ Fault (Bruinderink--Pessl, CHES'18) \\
+Out-of-spec accepted $r_0$ (forced accept, ex.\,08) & \code{spec\_aware} / \code{r0\_reject} & ``Finding a Polytope'' (PKC'25); the $r_0$-rejection bypass \\
+Biased nonce $y$ (loop abort, \code{funcskip}) & \code{uniformity} & loop-abort / nonce-zeroing (Espitau \emph{et al.}) \\
+Key-dependent ineffectiveness (planted) & \code{sifa} & SIFA (Dobraunig \emph{et al.}, 2018) \\
+Key-dependent fault \emph{effect} (planted) & \code{differential} & differential fault analysis (general) \\
+\midrule
+\multicolumn{3}{@{}l}{\textbf{Negatives --- nothing flagged (honest), and why}}\\
+\addlinespace[2pt]
+MAYO skip sweep (any site) & all $\leq 54\%$ / $0.0$ $\to$ none & oil leak is \GF{16}-algebraic; needs a \emph{data} fault exposing clean oil, then \code{structural} over \GF{16} \\
+\code{sifa} / \code{r0\_reject} on the skip surface & $0$ flagged & need the data-fault surface (\code{SET\_MEM}/\code{BITFLIP}); skip-only hangs or yields no $r_0$ \\
+\code{poly\_chknorm} skip & crash/hang & stale verdict $\to$ infinite reject loop (not a leak) \\
+\code{per\_coord}/TVLA at the unfaulted control & $p\approx0.007$ (false positive) & small-$N$ normal tail is anti-conservative; tolerated for a detector framework \\
+\code{differential} / \code{sifa} across the skip sweep & $0$ new after FDR & the skip surface's only secret leak is the mask removal (\code{two\_key}'s) \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 %======================================================================
 \section{Design Tradeoffs}\label{sec:tradeoffs}
