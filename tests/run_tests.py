@@ -691,6 +691,18 @@ def test_funcskip_parallel_jobs_invariant():
     assert r1.mode == "funcskip" and len(r1.rows) >= 5
 
 
+def test_funcskip_dumpdir_resolves():
+    """`funcskip --dumpdir BASE` writes the dump to BASE/<target>_instrskip/."""
+    import tempfile
+    from ucpqc import cli
+    need(DILITHIUM)
+    base = tempfile.mkdtemp(prefix="ucpqc-dumpdir-")
+    cli.main(["funcskip", DILITHIUM, "--target", "polyvecl_add", "--n", "4", "--dumpdir", base])
+    out = os.path.join(base, "polyvecl_add_instrskip")
+    assert os.path.isdir(out), f"expected dump dir {out}"
+    assert os.path.exists(os.path.join(out, "meta.json")), "meta.json written under the base dir"
+
+
 # --- runner -----------------------------------------------------------------
 
 

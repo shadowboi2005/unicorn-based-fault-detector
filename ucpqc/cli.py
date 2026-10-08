@@ -308,8 +308,11 @@ def cmd_detect(args):
 def cmd_funcskip(args):
     """Instruction-skip sweep inside one function, via capture-and-replay."""
     dump_dir = getattr(args, "dump", None)
-    if dump_dir == "__auto__":                    # `--dump` with no value -> <target>_instrskip
-        dump_dir = f"{args.target or 'funcskip'}_instrskip"
+    autoname = f"{args.target or 'funcskip'}_instrskip"
+    if getattr(args, "dumpdir", None):            # --dumpdir BASE -> BASE/<target>_instrskip/
+        dump_dir = os.path.join(args.dumpdir, autoname)
+    elif dump_dir == "__auto__":                  # `--dump` with no value -> <target>_instrskip
+        dump_dir = autoname
     if getattr(args, "jobs", 1) != 1:             # multithreaded path (free-threaded 3.14t)
         from . import parallel_funcskip as pf
         result = pf.sweep_function_dump_parallel(
@@ -529,6 +532,9 @@ def build_parser():
                    help="also write per-item challenge + every skip site's faulted outputs "
                         "to DIR (default <target>_instrskip/), for offline replay with "
                         "`ucpqc detect` -- no re-capture")
+    p.add_argument("--dumpdir", metavar="BASE",
+                   help="dump into BASE/<target>_instrskip/ (a clean base-dir form of "
+                        "--dump; implies dumping -- good for sweeping many targets into one dir)")
     _add_calibration_flags(p)
     p.set_defaults(handler=cmd_funcskip)
 
