@@ -173,9 +173,12 @@ class MLDSAProfile(AnalysisProfile):
     reject_bound = R0_BOUND
 
     def targets(self):
-        """Named funcskip targets (short name -> replay.Target)."""
+        """Named funcskip targets (short name -> replay.Target).  The curated few below
+        keep their descriptive labels; the full Dilithium-function table for the
+        LLVM-IR -> ARM translation study is merged in from `dilithium_targets`."""
+        from . import dilithium_targets
         pv = (("out", POLYVECL_BYTES), ("in", POLYVECL_BYTES), ("in", POLYVECL_BYTES))
-        return {
+        curated = {
             "polyvecl_add": Target(func="pqcrystals_dilithium_polyvecl_add",
                                    nth=-1, args=pv, out=0, label="polyvecl_add (z=z+y)"),
             "polyvecl_reduce": Target(func="pqcrystals_dilithium_polyvecl_reduce",
@@ -185,7 +188,6 @@ class MLDSAProfile(AnalysisProfile):
                                 nth=-1, args=(("out", POLYVECL_BYTES), ("in", 64),
                                               "scalar"), out=0,
                                 label="polyvecl_uniform_gamma1 (y)"),
-            # --- paper-leaky targets for per-function instruction-skip dumps ---
             "poly_challenge": Target(func="pqcrystals_dilithium_poly_challenge", nth=-1,
                                      args=(("out", POLY_BYTES), ("in", CTILDE_BYTES)), out=0,
                                      label="poly_challenge (SampleInBall -> c)"),
@@ -196,6 +198,7 @@ class MLDSAProfile(AnalysisProfile):
                                    args=(("in", POLY_BYTES), "scalar"), out="ret",
                                    label="poly_chknorm (rejection check)"),
         }
+        return {**dilithium_targets.TARGETS, **curated}
 
     def default_target(self):
         """The z = z + y mask add -- the intra-function funcskip target."""

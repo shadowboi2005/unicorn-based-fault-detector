@@ -673,7 +673,9 @@ def test_funcskip_dump_matches_live():
     for a in set(lv) & set(ov):
         assert (lv[a].metric, lv[a].pvalue, lv[a].status) == \
                (ov[a].metric, ov[a].pvalue, ov[a].status), f"row mismatch at {a:#x}"
+        assert lv[a].ineffective == ov[a].ineffective, f"ineffective mismatch at {a:#x}"
     assert {r.addr for r in live.leaks()} == {r.addr for r in off.leaks()}
+    assert any(r.ineffective is not None for r in off.rows), "ineffective axis is populated"
 
 
 def test_funcskip_parallel_jobs_invariant():

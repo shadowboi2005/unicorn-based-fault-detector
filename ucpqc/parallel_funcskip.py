@@ -143,7 +143,7 @@ def sweep_function_dump_parallel(elf_path, target_name, platform_name="mps2-an38
             else:
                 status = "pending"
             r = assess.SiteResult(row_d["pc"], row_d["text"], metric, status, ran,
-                                  crashed, pvalue=pvalue)
+                                  crashed, pvalue=pvalue, ineffective=row_d.get("ineffective"))
             rows.append(r)
             if site is not None:
                 site_recs.append(site)
@@ -161,7 +161,7 @@ def sweep_function_dump_parallel(elf_path, target_name, platform_name="mps2-an38
                 "detector": detector, "n": n, "key_mode": key_mode, "backend": "call",
                 "out_kind": "ret" if target.out == "ret" else "buffer",
                 "sites": [{"pc": s["pc"], "text": s["text"]} for s in site_recs]}
-        caps = {k: [[int(x) for x in cp.c] for cp in caps_by_key[k]] for k in ("A", "B")}
+        caps = {k: [assess._cap_record(cp) for cp in caps_by_key[k]] for k in ("A", "B")}
         dumpmod.write_funcskip_dump(dump_dir, meta, caps, site_recs)
 
     return assess.AssessmentResult(scheme.name, "funcskip", detector, n, rows,
