@@ -83,6 +83,35 @@ class Capture:
     golden_output: object = None   # bytes (buffer) or int (return value)
 
 
+def cap_to_dict(cap):
+    """Serialize a `call`-backend Capture (pure data) to a JSON-able dict, for a
+    persistent capture cache (`ucpqc.captures`).  `snap` (the snapshot-backend state)
+    is not serialized -- caches are built with the call backend.  Includes the
+    `golden_output` and the challenge `c` the assess layer attaches."""
+    g = cap.golden_output
+    return {
+        "key": cap.key, "entry": cap.entry, "ret": cap.ret,
+        "regs": dict(cap.regs), "out_ptr": cap.out_ptr,
+        "inputs": {str(i): b.hex() for i, b in cap.inputs.items()},
+        "scalars": {str(i): int(v) for i, v in cap.scalars.items()},
+        "golden": g.hex() if isinstance(g, (bytes, bytearray)) else g,
+        "c": [int(x) for x in getattr(cap, "c", [])],
+    }
+
+
+def cap_from_dict(d):
+    """Inverse of :func:`cap_to_dict`: rebuild a Capture ready for the call backend."""
+    import numpy as np
+    cap = Capture(key=d["key"], entry=d["entry"], ret=d["ret"],
+                  regs={k: int(v) for k, v in d["regs"].items()}, out_ptr=d["out_ptr"])
+    cap.inputs = {int(i): bytes.fromhex(h) for i, h in d["inputs"].items()}
+    cap.scalars = {int(i): int(v) for i, v in d["scalars"].items()}
+    g = d["golden"]
+    cap.golden_output = bytes.fromhex(g) if isinstance(g, str) else g
+    cap.c = np.array(d.get("c", []), float)
+    return cap
+
+
 # --------------------------------------------------------------------------
 # recorder -- capture the target's I/O across golden signings
 # --------------------------------------------------------------------------

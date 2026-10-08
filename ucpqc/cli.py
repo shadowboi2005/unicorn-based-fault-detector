@@ -305,6 +305,21 @@ def cmd_detect(args):
     return _emit(args, result)
 
 
+def cmd_capture(args):
+    """Build a persistent funcskip capture cache: one 2N-signing pass that records every
+    target's I/O, saved under --out.  Later `funcskip --captures DIR` replays from it
+    with no re-signing (across targets, reruns and sessions)."""
+    from . import captures as capmod
+    names = [args.target] if args.target else None
+    out, manifest = capmod.capture_all(
+        args.elf, args.out, targets=names, platform=args.platform, n=args.n,
+        jobs=args.jobs, key_mode=args.key_mode, profile_override=getattr(args, "profile", None))
+    ntgt = len(manifest["targets"])
+    print(f"captured {ntgt} target(s) x {manifest['n']} signings/key to {out}/  "
+          f"(replay any with:  ucpqc funcskip {args.elf} --target <fn> --captures {out})")
+    return 0
+
+
 def cmd_funcskip(args):
     """Instruction-skip sweep inside one function, via capture-and-replay."""
     dump_dir = getattr(args, "dump", None)
@@ -313,6 +328,20 @@ def cmd_funcskip(args):
         dump_dir = os.path.join(args.dumpdir, autoname)
     elif dump_dir == "__auto__":                  # `--dump` with no value -> <target>_instrskip
         dump_dir = autoname
+    if getattr(args, "captures", None):           # replay from a saved capture cache (no re-sign)
+        from . import captures as capmod, parallel_funcskip as pf
+        meta, caps = capmod.load_captures(args.captures, args.target)
+        result = pf.sweep_function_dump_parallel(
+            args.elf, args.target, platform_name=args.platform, n=meta["n"], jobs=args.jobs,
+            key_mode=meta.get("key_mode", "independent"),
+            profile_override=getattr(args, "profile", None), detector=args.detector,
+            calibrate=not args.legacy_thresholds, n_perm=args.n_perm, fdr_q=args.fdr,
+            correction=args.correction, dump_dir=dump_dir, caps_by_key=caps)
+        rc = _emit(args, result)
+        if dump_dir:
+            print(f"\ndumped {len(result.rows)} skip sites to {dump_dir}/ (from cache "
+                  f"{args.captures}; replay offline with:  ucpqc detect {dump_dir})")
+        return rc
     if getattr(args, "jobs", 1) != 1:             # multithreaded path (free-threaded 3.14t)
         from . import parallel_funcskip as pf
         result = pf.sweep_function_dump_parallel(
@@ -535,8 +564,25 @@ def build_parser():
     p.add_argument("--dumpdir", metavar="BASE",
                    help="dump into BASE/<target>_instrskip/ (a clean base-dir form of "
                         "--dump; implies dumping -- good for sweeping many targets into one dir)")
+    p.add_argument("--captures", metavar="DIR",
+                   help="replay from a saved capture cache (built by `ucpqc capture`) instead "
+                        "of re-signing -- fast, reusable across targets/reruns/sessions")
     _add_calibration_flags(p)
     p.set_defaults(handler=cmd_funcskip)
+
+    p = sub.add_parser("capture", help="build a persistent funcskip capture cache "
+                       "(one 2N-signing pass over all targets) for reuse with "
+                       "`funcskip --captures`")
+    add_elf(p)
+    p.add_argument("--out", default="captures", metavar="DIR",
+                   help="directory to write the capture cache into (default captures/)")
+    p.add_argument("--target", help="capture only this target (default: every profile target)")
+    p.add_argument("--n", type=int, default=40, help="signatures per key to capture")
+    p.add_argument("-j", "--jobs", type=int, default=0,
+                   help="worker threads (0=all cores; free-threaded 3.14t for real parallelism)")
+    p.add_argument("--key-mode", default="independent", choices=("independent", "sibling"))
+    p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
+    p.set_defaults(handler=cmd_capture)
 
     return parser
 

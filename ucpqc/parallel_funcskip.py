@@ -95,12 +95,16 @@ def sweep_function_dump_parallel(elf_path, target_name, platform_name="mps2-an38
                                  key_mode="independent", profile_override=None,
                                  detector=None, budget=5_000_000, calibrate=True,
                                  n_perm=assess.DEFAULT_N_PERM, fdr_q=assess.FDR_Q,
-                                 correction="bh", dump_dir=None, progress=None):
+                                 correction="bh", dump_dir=None, progress=None,
+                                 caps_by_key=None):
     """Run a funcskip sweep over `target_name` with `jobs` threads and (optionally)
     write a dump to `dump_dir`.  Capture is parallelised over the 2N signings, replay
     over the skip sites, so a capture-bound (few-site) and a replay-bound (many-site)
     target both scale.  Returns an `AssessmentResult` (mode ``funcskip``).  Intended
-    for the free-threaded interpreter; on a GIL build it is correct but serial."""
+    for the free-threaded interpreter; on a GIL build it is correct but serial.
+
+    `caps_by_key` ({key: [Capture]}): if given, SKIP the capture phase and replay these
+    pre-loaded captures (the `--captures` cache path) -- no re-signing."""
     import os
     jobs = jobs or (os.cpu_count() or 1)
 
@@ -116,16 +120,17 @@ def sweep_function_dump_parallel(elf_path, target_name, platform_name="mps2-an38
     featurize = assess._make_featurize(profile, detector)
     detect = assess._make_detect(profile, detector, calibrate, n_perm)
 
-    # ---- phase 1: parallel capture (2N signings) ----
-    raw = {"A": {}, "B": {}}
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
-        futs = [pool.submit(_capture_item, ctx_args, target, k, i, messages[i], budget)
-                for k in ("A", "B") for i in range(n)]
-        for f in futs:
-            key, i, cap = f.result()
-            if cap is not None:
-                raw[key][i] = cap
-    caps_by_key = {k: [raw[k][i] for i in sorted(raw[k])] for k in ("A", "B")}
+    # ---- phase 1: parallel capture (2N signings) -- skipped if captures were supplied
+    if caps_by_key is None:
+        raw = {"A": {}, "B": {}}
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futs = [pool.submit(_capture_item, ctx_args, target, k, i, messages[i], budget)
+                    for k in ("A", "B") for i in range(n)]
+            for f in futs:
+                key, i, cap = f.result()
+                if cap is not None:
+                    raw[key][i] = cap
+        caps_by_key = {k: [raw[k][i] for i in sorted(raw[k])] for k in ("A", "B")}
 
     # ---- phase 2: parallel replay (skip sites) ----
     rows, site_recs = [], []

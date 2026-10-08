@@ -705,6 +705,24 @@ def test_funcskip_dumpdir_resolves():
     assert os.path.exists(os.path.join(out, "meta.json")), "meta.json written under the base dir"
 
 
+def test_capture_cache_replays_identically():
+    """A persistent capture cache replays to the SAME funcskip verdict as a direct run
+    (so `funcskip --captures` can skip the expensive re-signing)."""
+    import tempfile
+    from ucpqc import captures as capmod
+    from ucpqc.parallel_funcskip import sweep_function_dump_parallel as P
+    need(DILITHIUM)
+    d = tempfile.mkdtemp(prefix="ucpqc-caps-")
+    _, man = capmod.capture_all(DILITHIUM, d, targets=["polyvecl_add"], n=6, jobs=2)
+    assert "polyvecl_add" in man["targets"] and man["n"] == 6
+    _, caps = capmod.load_captures(d, "polyvecl_add")
+    fromcache = P(DILITHIUM, "polyvecl_add", n=man["n"], jobs=2, caps_by_key=caps)
+    direct = P(DILITHIUM, "polyvecl_add", n=6, jobs=2)
+    vc = {r.addr: (r.metric, r.pvalue, r.status, r.ineffective) for r in fromcache.rows}
+    vd = {r.addr: (r.metric, r.pvalue, r.status, r.ineffective) for r in direct.rows}
+    assert vc == vd, "capture-cache replay must match a direct capture+replay run"
+
+
 # --- runner -----------------------------------------------------------------
 
 
