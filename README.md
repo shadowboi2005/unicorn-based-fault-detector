@@ -52,11 +52,22 @@ python -m ucpqc profile   fw.elf --op sign --top 15
 python -m ucpqc calls     fw.elf --op keypair --depth 4
 python -m ucpqc trace     fw.elf --func ntt --scope body --csv ntt.csv
 python -m ucpqc fault     fw.elf --func challenge --model skip --hit 2 --csv faults.csv
-python -m ucpqc sweep     fw.elf --n 24                    # whole-call leak sweep (ALAFA)
-python -m ucpqc funcskip  fw.elf --target polyvecl_add     # intra-function skip sweep
+python -m ucpqc sweep     fw.elf --n 24 --dump dump       # whole-call leak sweep (ALAFA), + dump
+python -m ucpqc funcskip  fw.elf --target polyvecl_add    # intra-function skip sweep
+python -m ucpqc capture   fw.elf --n 40 --out captures    # one signing pass -> reusable cache
+python -m ucpqc funcskip  fw.elf --target poly_add --captures captures --dumpdir dumps  # replay, no re-sign
+python -m ucpqc detect    dumps/poly_add_instrskip --detector structural   # re-score offline, no emulator
 python -m ucpqc build     crypto_kem/ml-kem-768/m4fspeed
 python -m ucpqc schemes   dilithium         # what is available in the pqm4 tree
 ```
+
+**Capture once, replay many.** The expensive part of `funcskip` is the 2N signings
+it captures; `ucpqc capture` does that **once** for every target and saves a cache, so
+`funcskip --captures DIR` (and reruns, across sessions) replay with no re-signing.
+`--dump`/`--dumpdir` then persist the per-site faulted outputs + the unfaulted baseline,
+so `ucpqc detect` re-scores any detector **offline** (no emulator). Convenience wrappers
+for all of this live in [`scripts/`](scripts/README.md) (`capture.sh`, `run_funcskip.sh`,
+`detect.sh`, `run_sweep.sh`, …).
 
 `sweep` and `funcskip` are the two **fault-leakage assessment modes** — they ask
 whether a *fault* makes the output leak the secret key (no side-channel traces
