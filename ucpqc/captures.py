@@ -52,7 +52,10 @@ def _capture_item(args, target_items, key, i, msg, budget):
     w = _worker(*args, target_items)
     m, scheme, profile, recs = w["m"], w["scheme"], w["profile"], w["recs"]
     m.restore(w["clean"])
-    w["stream"].reset(f"nonce-{key}-{i}".encode())
+    # SHARED per-message seed (same for key A and B) so a signing's only difference between
+    # keys is the secret key itself -- needed to isolate key-dependence (leak AND the phi_IF
+    # key-dependent-ineffective test). Still per-i deterministic => jobs-invariant.
+    w["stream"].reset(f"nonce-{i}".encode())
     for r in recs.values():
         r.arm()
     try:

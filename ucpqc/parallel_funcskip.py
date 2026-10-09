@@ -58,7 +58,9 @@ def _capture_item(ctx_args, target, key, i, msg, budget):
     w = _worker(*ctx_args)
     m, scheme, profile = w["m"], w["scheme"], w["profile"]
     m.restore(w["clean"])
-    w["stream"].reset(f"nonce-{key}-{i}".encode())
+    # shared per-message seed (same for A and B) so only the secret key differs between the
+    # two populations -- isolates key-dependence for the leak and key-dependent-ineffective tests
+    w["stream"].reset(f"nonce-{i}".encode())
     rec = Recorder(m, target, snapshot=False)           # "call" backend: pure-data caps
     rec.arm()
     try:
