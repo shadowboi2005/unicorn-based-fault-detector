@@ -808,6 +808,75 @@ verdict.},label={lst:calib}]
   -> 2 leaking site(s) at FDR<=0.01: 0x46d2 mov r7, r0, 0x46e4 bl #0x3d94
 \end{lstlisting}
 
+\subsection{LLVM-IR\,$\to$\,ARM translation and key-dependent ineffectiveness
+($\varphi_{\mathrm{IF}}$)}\label{sec:llvmstudy}
+Mapping the \textsc{Dilithium-LLVM} IR-level fault findings onto the compiled ARM
+binary---\code{funcskip} over the $29$ reference functions, $n{=}40$ signatures per
+key---sharpens two detector axes that must not be conflated: the \emph{correction}
+axis (the faulted \emph{output distribution} differs by key: our \code{per\_coord}/TVLA
+test) and the \emph{ineffective} axis (whether the skip is a \emph{no-op} differs by
+key). On the correction axis only \code{polyvecl\_add} leaks ($5/10$ sites,
+$\max|t|\approx16.9$ against a $3$--$4.5$ no-leak floor), so IR value-corruption
+findings translate poorly to whole-instruction skips; and the \code{m4f} compiler
+inlines $8$ reference functions (\code{polyveck\_add/sub/chknorm/make\_hint}, the
+$c\cdot s$ \code{*\_pointwise\_poly\_montgomery} multiplies,
+\code{polyvecl\_invntt}/\code{pointwise\_acc}) out of the signing path, shrinking the
+fault surface below the IR the tool analysed.
+
+The ineffective axis is the SIFA-style test $\varphi_{\mathrm{IF}}$: a
+\emph{key-dependent} ineffective fault,
+$\exists\,p\;\exists\,s_1,s_2:\ \Delta(\mathrm{fault}(s_1,p),\mathrm{gold}(s_1,p)){=}0
+\,\wedge\, \Delta(\mathrm{fault}(s_2,p),\mathrm{gold}(s_2,p)){\neq}0$. We test it per
+skip site with keys $A,B$ signing the \emph{same} message and signing-RNG (only
+\code{sk} differs), counting \emph{flips}---messages where the skip is a no-op for one
+key but output-changing for the other. This surfaces $71$ $\varphi_{\mathrm{IF}}$ sites
+across four reachable functions (Table~\ref{tab:phiif}), where the earlier rate-based
+\code{sifa} detector---comparing no-op \emph{rates} across unrelated signings---had
+flagged none.
+
+\begin{table}[h]
+\centering\footnotesize
+\caption{Key-dependent-ineffective ($\varphi_{\mathrm{IF}}$) sites on the ARM skip
+surface, with the value that governs ineffectiveness. Only \code{ntt} is driven by a
+\emph{hidden} quantity; the rest key on values that are public.}
+\label{tab:phiif}
+\begin{tabular}{@{}lrl@{}}
+\toprule
+Function & $\varphi_{\mathrm{IF}}$ sites (flips) & Governing value \\
+\midrule
+\code{ntt} & $63$ ($261$) & \textbf{secret-derived} (NTT of masked/secret polynomials) \\
+\code{poly\_challenge} & $5$ ($7$) & \emph{public}: $\tilde c$, published in $\sigma$ \\
+\code{polyvecl\_uniform\_gamma1} & $2$ ($38$) & secret: $y$ from $\rho'{=}H(K\,\|\,\mu)$ \\
+\code{poly\_chknorm} & $1$ ($1$) & public-ish: norm check of $z$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two observations qualify these counts. First, they are \emph{partial}: most sites flip
+on only a handful of the $40$ messages, because a single-instruction skip is a no-op
+only under a rare boundary condition---a redundant store, a dead write later
+overwritten, an unused sign bit. At \code{poly\_challenge}'s coefficient store
+\code{0x4122} the skip is \emph{effective} in $38/40$ messages for $A$ and $39/40$ for
+$B$; a flip needs one key to hit the rare no-op where the other does not, which occurs
+at just $3$ messages. Second---and more important for interpretation---the
+``key-dependence'' is really \emph{input}-dependence: changing the key changes the
+function's \emph{input}, and no-op-ness is a deterministic function of that input. For
+\code{poly\_challenge} the input is the challenge seed $\tilde c = H(\mu\,\|\,w_1)$;
+$w_1$ is secret-derived, so $A$ and $B$ feed \emph{different} $\tilde c$ (we confirm
+$\mathrm{gold}_A\neq\mathrm{gold}_B$ at every message) and the no-op boundary falls at
+different messages. But $\tilde c$ is \emph{published} in the signature
+$\sigma=(\tilde c, z, h)$: the ineffectiveness depends on a value the attacker already
+sees, so these sites are \emph{not} a secret oracle---they are SIFA false positives,
+as is \code{poly\_chknorm} (keyed on the norm check of the near-public $z$). The one
+surface where ineffectiveness tracks a \emph{hidden} quantity is \code{ntt}, whose
+operands are the NTT of secret/masked polynomials that are not directly published; and
+because the obvious $c\cdot s$ multiplies are inlined away, the genuine
+key-dependent-ineffective surface lands there, on the Montgomery butterflies
+(\code{smull}/\code{smlal}/\code{mul}/\code{add}). The corrected reading is therefore
+not ``SIFA is absent on the skip surface'' but ``key-dependent ineffectiveness is
+\emph{present} yet overwhelmingly \emph{public}-data-driven, with the NTT the lone
+secret-relevant site.''
+
 \subsection{MAYO: an honest negative result}
 On MAYO the whole-call sweep finds \emph{zero} leaking sites, and this is the correct
 answer for the current fault surface. The control sits at chance (46\%): fresh
@@ -869,7 +938,7 @@ MAYO skip sweep (any site) & all $\leq 54\%$ / $0.0$ $\to$ none & oil leak is \G
 \code{sifa} / \code{r0\_reject} on the skip surface & $0$ flagged & need the data-fault surface (\code{SET\_MEM}/\code{BITFLIP}); skip-only hangs or yields no $r_0$ \\
 \code{poly\_chknorm} skip & crash/hang & stale verdict $\to$ infinite reject loop (not a leak) \\
 \code{per\_coord}/TVLA at the unfaulted control & $p\approx0.007$ (false positive) & small-$N$ normal tail is anti-conservative; tolerated for a detector framework \\
-\code{differential} / \code{sifa} across the skip sweep & $0$ new after FDR & the skip surface's only secret leak is the mask removal (\code{two\_key}'s) \\
+\code{differential} / \code{sifa} across the skip sweep & $0$ new after FDR & the skip surface's only secret leak is the mask removal (\code{two\_key}'s); the direct $\varphi_{\mathrm{IF}}$ reading (\S\ref{sec:llvmstudy}) finds key-dependent ineffectiveness present but public-data-driven except in the NTT \\
 \bottomrule
 \end{tabular}
 \end{table}
