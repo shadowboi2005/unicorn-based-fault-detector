@@ -336,7 +336,8 @@ def cmd_funcskip(args):
             key_mode=meta.get("key_mode", "independent"),
             profile_override=getattr(args, "profile", None), detector=args.detector,
             calibrate=not args.legacy_thresholds, n_perm=args.n_perm, fdr_q=args.fdr,
-            correction=args.correction, dump_dir=dump_dir, caps_by_key=caps)
+            correction=args.correction, dump_dir=dump_dir, caps_by_key=caps,
+            replay_budget=args.replay_budget)
         rc = _emit(args, result)
         if dump_dir:
             print(f"\ndumped {len(result.rows)} skip sites to {dump_dir}/ (from cache "

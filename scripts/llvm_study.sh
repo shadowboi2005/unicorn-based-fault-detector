@@ -12,6 +12,12 @@ N="${1:-40}"; JOBS="${2:-14}"
 # how many targets to replay concurrently x threads each (PT*PJ ~= cores); the captures
 # are cached, so replay is cheap and we fan out ACROSS targets to use all cores.
 PT="${PT:-5}"; PJ="${PJ:-4}"
+# per-replay instruction cap: a skip that breaks a loop makes a replay run away to
+# this budget before it is killed as a crash. The natural replay of these functions
+# is <=53k insns (poly_uniform's SHAKE rejection is the longest), so 500k is ~10x
+# headroom and only ever truncates genuine runaways -- identical verdicts, ~10x less
+# wasted work on the big NTT/INTT sweeps.  Override with RB=... .
+RB="${RB:-500000}"
 
 if [ -f captures/manifest.json ]; then
   echo ">> [1/3] capture cache present -> skipping capture (rm -rf captures to rebuild)"
@@ -29,7 +35,7 @@ mkdir -p dumps/run_log
 printf '%s\n' $TARGETS | xargs -P "$PT" -I{} bash -c '
   t="$1"
   '"$PY"' -m ucpqc funcskip '"$ELF"' --target "$t" --captures captures --detector per_coord \
-      -j '"$PJ"' --dumpdir dumps > dumps/run_log/"$t".log 2>&1 \
+      -j '"$PJ"' --replay-budget '"$RB"' --dumpdir dumps > dumps/run_log/"$t".log 2>&1 \
     && echo "   done $t -> $(grep -oE "[0-9]+ leaking site" dumps/run_log/$t.log | head -1)" \
     || echo "   FAILED $t"
 ' _ {}
