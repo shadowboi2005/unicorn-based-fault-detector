@@ -61,8 +61,9 @@ def arm_row(fn):
         flips = sum(1 for i in (set(effA) & set(effB)) if effA[i] != effB[i])
         phi_flips += flips
         if flips: phi_sites += 1
+    leak_sites = [(r.addr, r.label, r.metric) for r in sorted(leaks, key=lambda r: r.addr)]
     return dict(scored=len(scored), leak=len(leaks), maxt=maxt, maxineff=maxineff,
-                phi_sites=phi_sites, phi_flips=phi_flips)
+                phi_sites=phi_sites, phi_flips=phi_flips, leak_sites=leak_sites)
 
 def fmt(dt_): return f"{dt_[0]}/{dt_[1]}" if dt_ else "-"
 
@@ -124,6 +125,23 @@ P("- The m4f optimising compiler **inlines 8 of the reference functions out of t
   "(`polyveck_add/sub/chknorm/make_hint`, the `c·s` `*_pointwise_poly_montgomery` multiplies, "
   "`polyvecl_invntt_tomont`/`pointwise_acc`), so the ARM fault surface is **smaller** than the IR the LLVM tool "
   "analysed -- compilation itself changes what can be faulted.\n")
+P("## Where the key leaks (correction axis)\n")
+_leakers = [(fn, a) for fn, l, note, a in rows if a is not None and a.get("leak_sites")]
+if _leakers:
+    for fn, a in _leakers:
+        P(f"**`{fn}`** -- {a['leak']} LEAK site(s) (max\\|t\\|={a['maxt']:.1f}):\n")
+        P("| addr | max\\|t\\| | instruction |")
+        P("|---|---|---|")
+        for addr, text, m in a["leak_sites"]:
+            P(f"| `{addr:#06x}` | {m:.1f} | `{text}` |")
+        P("")
+    P("`polyvecl_add` is the response mask add `z = z + y` looped over the L=4 secret polynomials; "
+      "skipping the output-pointer setup (`mov r7,r0`), the per-poly `bl poly_add`, or the loop control "
+      "(`cmp`/`bne`) drops one or more adds, so the emitted `z` exposes the deterministic `c·s1` term -- "
+      "the canonical *Exploiting Determinism* fault. The |t|≈16.9 here sits far above the ~3-4.5 no-leak "
+      "floor seen at every other site.\n")
+else:
+    P("No ARM function showed a LEAK site at FDR≤0.01.\n")
 P("## Per-function\n")
 P("| function | LLVM ineff | LLVM corr | ARM leak (LEAK/scored, max\\|t\\|) | ARM φIF sites (flips) | note |")
 P("|---|---|---|---|---|---|")
@@ -133,6 +151,20 @@ for fn,l,note,a in rows:
         P(f"| `{fn}` | {li} | {lc} | — | — | {note or 'no dump'} |")
     else:
         P(f"| `{fn}` | {li} | {lc} | {a['leak']}/{a['scored']}, |t|={a['maxt']:.1f} | {a['phi_sites']} ({a['phi_flips']}) | |")
+
+# plots: per-instruction ARM TVLA maps (built by scripts/plot_regions.py), leaker first
+PLOT_ORDER = ["polyvecl_add", "ntt", "invntt_tomont", "poly_uniform", "poly_decompose",
+              "poly_make_hint", "poly_sub", "polyvec_matrix_pointwise_montgomery"]
+_plots = [fn for fn in PLOT_ORDER if os.path.exists(f"examples/plots/{fn}_by_instr.png")]
+if _plots:
+    P("## Plots\n")
+    P("Per-instruction ARM TVLA maps (max\\|Welch t\\|, A vs B) across each function body, annotated with the")
+    P("function's LLVM-IR tainted-instruction count. **Red** = LEAK (FDR≤0.01), grey = no leak, light = skip-crash;")
+    P("the dashed line is the |t|≈4.5 flag threshold. Paths are relative to this file (`report/`).\n")
+    for fn in _plots:
+        tag = " — the key leak (mask add `z=z+y`)" if fn == "polyvecl_add" else ""
+        P(f"### `pqcrystals_dilithium_{fn}`{tag}\n")
+        P(f"![{fn} per-instruction TVLA](../examples/plots/{fn}_by_instr.png)\n")
 
 os.makedirs("report", exist_ok=True)
 with open("report/llvm_vs_arm.md","w") as fh: fh.write("\n".join(out)+"\n")

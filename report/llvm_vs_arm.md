@@ -28,6 +28,20 @@ for the other. (`correction` stays the leak axis = `per_coord`/TVLA LEAK.)
 - **φIF (key-dependent ineffective, = SIFA-exploitable):** 71 such sites across 4 functions. These are the skip points where whether the fault is a no-op *depends on the secret key* -- the actual target of the LLVM ineffective test, now measured with A/B sharing the public input so the key is the only variable.
 - The m4f optimising compiler **inlines 8 of the reference functions out of the signing path** (`polyveck_add/sub/chknorm/make_hint`, the `c·s` `*_pointwise_poly_montgomery` multiplies, `polyvecl_invntt_tomont`/`pointwise_acc`), so the ARM fault surface is **smaller** than the IR the LLVM tool analysed -- compilation itself changes what can be faulted.
 
+## Where the key leaks (correction axis)
+
+**`polyvecl_add`** -- 5 LEAK site(s) (max\|t\|=16.9):
+
+| addr | max\|t\| | instruction |
+|---|---|---|
+| `0x46d2` | 16.9 | `mov r7, r0` |
+| `0x46dc` | 4.6 | `adds r1, r6, r4` |
+| `0x46e4` | 16.9 | `bl #0x3d94` |
+| `0x46e8` | 16.9 | `cmp.w r4, #0x1000` |
+| `0x46ec` | 16.9 | `bne #0x46da` |
+
+`polyvecl_add` is the response mask add `z = z + y` looped over the L=4 secret polynomials; skipping the output-pointer setup (`mov r7,r0`), the per-poly `bl poly_add`, or the loop control (`cmp`/`bne`) drops one or more adds, so the emitted `z` exposes the deterministic `c·s1` term -- the canonical *Exploiting Determinism* fault. The |t|≈16.9 here sits far above the ~3-4.5 no-leak floor seen at every other site.
+
 ## Per-function
 
 | function | LLVM ineff | LLVM corr | ARM leak (LEAK/scored, max\|t\|) | ARM φIF sites (flips) | note |
@@ -70,3 +84,41 @@ for the other. (`correction` stays the leak axis = `per_coord`/TVLA LEAK.)
 | `polyvecl_uniform_eta` | 1/1 | 1/1 | — | — | keygen-only (not sign-reachable) |
 | `polyvecl_uniform_gamma1` | 1/1 | 1/1 | 0/10, |t|=4.5 | 2 (38) | |
 | `signature_internal` | 15/23 | 11/22 | — | — | whole-sign top level (see `sweep` mode) |
+## Plots
+
+Per-instruction ARM TVLA maps (max\|Welch t\|, A vs B) across each function body, annotated with the
+function's LLVM-IR tainted-instruction count. **Red** = LEAK (FDR≤0.01), grey = no leak, light = skip-crash;
+the dashed line is the |t|≈4.5 flag threshold. Paths are relative to this file (`report/`).
+
+### `pqcrystals_dilithium_polyvecl_add` — the key leak (mask add `z=z+y`)
+
+![polyvecl_add per-instruction TVLA](../examples/plots/polyvecl_add_by_instr.png)
+
+### `pqcrystals_dilithium_ntt`
+
+![ntt per-instruction TVLA](../examples/plots/ntt_by_instr.png)
+
+### `pqcrystals_dilithium_invntt_tomont`
+
+![invntt_tomont per-instruction TVLA](../examples/plots/invntt_tomont_by_instr.png)
+
+### `pqcrystals_dilithium_poly_uniform`
+
+![poly_uniform per-instruction TVLA](../examples/plots/poly_uniform_by_instr.png)
+
+### `pqcrystals_dilithium_poly_decompose`
+
+![poly_decompose per-instruction TVLA](../examples/plots/poly_decompose_by_instr.png)
+
+### `pqcrystals_dilithium_poly_make_hint`
+
+![poly_make_hint per-instruction TVLA](../examples/plots/poly_make_hint_by_instr.png)
+
+### `pqcrystals_dilithium_poly_sub`
+
+![poly_sub per-instruction TVLA](../examples/plots/poly_sub_by_instr.png)
+
+### `pqcrystals_dilithium_polyvec_matrix_pointwise_montgomery`
+
+![polyvec_matrix_pointwise_montgomery per-instruction TVLA](../examples/plots/polyvec_matrix_pointwise_montgomery_by_instr.png)
+

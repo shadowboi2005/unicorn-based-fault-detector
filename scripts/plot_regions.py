@@ -11,8 +11,8 @@ import matplotlib.pyplot as plt
 from ucpqc import Machine, Scheme, assess
 
 TAINT = "../Dilithium-LLVM/llvm/taintResults"
-BIG = ["ntt", "invntt_tomont", "poly_uniform", "poly_decompose", "poly_make_hint",
-       "poly_sub", "polyvec_matrix_pointwise_montgomery"]
+BIG = ["polyvecl_add", "ntt", "invntt_tomont", "poly_uniform", "poly_decompose",
+       "poly_make_hint", "poly_sub", "polyvec_matrix_pointwise_montgomery"]
 TH = 4.5
 
 def llvm_taint(fn):
