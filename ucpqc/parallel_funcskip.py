@@ -95,14 +95,20 @@ def sweep_function_dump_parallel(elf_path, target_name, platform_name="mps2-an38
                                  key_mode="independent", profile_override=None,
                                  detector=None, budget=5_000_000, calibrate=True,
                                  n_perm=assess.DEFAULT_N_PERM, fdr_q=assess.FDR_Q,
-                                 correction="bh", dump_dir=None, progress=None):
+                                 correction="bh", dump_dir=None, progress=None,
+                                 replay_budget=None):
     """Run a funcskip sweep over `target_name` with `jobs` threads and (optionally)
     write a dump to `dump_dir`.  Capture is parallelised over the 2N signings, replay
     over the skip sites, so a capture-bound (few-site) and a replay-bound (many-site)
     target both scale.  Returns an `AssessmentResult` (mode ``funcskip``).  Intended
-    for the free-threaded interpreter; on a GIL build it is correct but serial."""
+    for the free-threaded interpreter; on a GIL build it is correct but serial.
+
+    `budget` caps the capture signings; `replay_budget` (default = `budget`) caps each
+    skip-replay -- lowering it kills loop-breaking runaway replays sooner (they are
+    scored as crashes either way), the dominant replay cost."""
     import os
     jobs = jobs or (os.cpu_count() or 1)
+    replay_budget = replay_budget or budget
 
     # coordinator: resolve target + sites + the featurize/detect closures (all pure)
     ctx_args = (elf_path, platform_name, keys, key_mode, profile_override)
@@ -131,7 +137,7 @@ def sweep_function_dump_parallel(elf_path, target_name, platform_name="mps2-an38
     rows, site_recs = [], []
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         futs = [pool.submit(_replay_one, ctx_args, target, spec, caps_by_key,
-                            featurize, detect, budget) for spec in specs]
+                            featurize, detect, replay_budget) for spec in specs]
         for f in futs:
             row_d, site = f.result()
             metric, pvalue = row_d.get("metric"), row_d.get("pvalue")
