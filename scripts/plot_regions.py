@@ -46,14 +46,19 @@ def plot(fn, m):
             vals.append(r.metric); cols.append("#c0392b" if r.status == "LEAK" else "#8a97a4"); crash.append(False)
     taint = llvm_taint(fn)
     tstr = ", ".join(f"{n}×{t.replace('Inst','')}" for t, n in taint.most_common()) or "none"
-    fig, ax = plt.subplots(figsize=(max(8, len(instrs) * 0.5), 4.6))
+    wide = len(instrs) > 60                               # too many instrs to label individually
+    fig, ax = plt.subplots(figsize=(min(22, max(8, len(instrs) * 0.5)), 4.6))
     x = np.arange(len(instrs))
-    ax.bar(x, vals, color=cols, width=0.72)
-    for i, c in enumerate(crash):
-        if c: ax.text(i, 0.1, "crash", ha="center", va="bottom", fontsize=6, color="#8a97a4", rotation=90)
+    ax.bar(x, vals, color=cols, width=0.9 if wide else 0.72)
     ax.axhline(TH, color="#555", ls="--", lw=1)
-    ax.set_xticks(x); ax.set_xticklabels([f"{pc:#06x} {t}" for pc, t in instrs],
-                                         rotation=55, ha="right", fontsize=6.5, family="monospace")
+    if wide:
+        ax.set_xlabel(f"instruction index  (0..{len(instrs)-1};  {len(instrs)} instrs, "
+                      f"{sum(crash)} skip-crashes)")
+    else:
+        for i, c in enumerate(crash):
+            if c: ax.text(i, 0.1, "crash", ha="center", va="bottom", fontsize=6, color="#8a97a4", rotation=90)
+        ax.set_xticks(x); ax.set_xticklabels([f"{pc:#06x} {t}" for pc, t in instrs],
+                                             rotation=55, ha="right", fontsize=6.5, family="monospace")
     ax.set_ylabel("max |Welch t| (A vs B)")
     ax.set_title(f"ARM per-instruction TVLA — pqcrystals_dilithium_{fn}  (n={res.n})\n"
                  f"red=LEAK (FDR≤0.01), grey=no leak, light=crash   |   "
