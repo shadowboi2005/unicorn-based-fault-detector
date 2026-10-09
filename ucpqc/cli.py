@@ -348,7 +348,8 @@ def cmd_funcskip(args):
             args.elf, args.target, platform_name=args.platform, n=args.n, jobs=args.jobs,
             key_mode=args.key_mode, profile_override=getattr(args, "profile", None),
             detector=args.detector, calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
-            fdr_q=args.fdr, correction=args.correction, dump_dir=dump_dir)
+            fdr_q=args.fdr, correction=args.correction, dump_dir=dump_dir,
+            replay_budget=args.replay_budget)
         rc = _emit(args, result)
         if dump_dir:
             print(f"\ndumped {len(result.rows)} skip sites to {dump_dir}/ "
@@ -365,6 +366,7 @@ def cmd_funcskip(args):
         target = targets[args.target]
     result = assessmod.sweep_function(scheme, profile, target=target, n=args.n,
                                       detector=args.detector, backend=args.backend,
+                                      budget=args.replay_budget,
                                       calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
                                       fdr_q=args.fdr, correction=args.correction,
                                       key_mode=args.key_mode, dump=dump_dir)
@@ -552,6 +554,13 @@ def build_parser():
                             "mmd", "uniformity", "spec_aware"),
                    help="override the profile's detector for the target")
     p.add_argument("--backend", default="call", choices=("call", "snapshot"))
+    p.add_argument("--replay-budget", type=int, default=5_000_000, dest="replay_budget",
+                   metavar="INSNS",
+                   help="max instructions per skip-replay (default 5e6). A skip that breaks "
+                        "the target's loop control makes an isolated replay run to this cap "
+                        "before it is killed as a crash; since a runaway produces no usable "
+                        "output anyway, lowering this to ~10x the function's natural length "
+                        "(tens of k) kills runaways far sooner with identical verdicts")
     p.add_argument("-j", "--jobs", type=int, default=1,
                    help="worker threads (1=serial; >1 parallelizes capture + replay, "
                         "best on the free-threaded 3.14t interpreter)")
