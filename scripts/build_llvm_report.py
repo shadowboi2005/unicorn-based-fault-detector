@@ -123,9 +123,13 @@ P("- Under whole-instruction skip, the ARM binary leaks the key (correction axis
   "mask add `polyvecl_add` (`z = z + y`), the canonical Exploiting-Determinism fault -- while every other reachable "
   "function shows **0** leaking sites. LLVM's value-level correction faults translate **poorly** to instruction-skip "
   "key leakage (a skip is a coarser fault than an IR bit/value corruption).")
-P(f"- **φIF (key-dependent ineffective, = SIFA-exploitable):** {phi_total} such sites across {phi_funcs} functions. "
-  "These are the skip points where whether the fault is a no-op *depends on the secret key* -- the actual target of "
-  "the LLVM ineffective test, now measured with A/B sharing the public input so the key is the only variable.")
+P(f"- **φIF (key-dependent ineffective -- SIFA *candidate* surface):** {phi_total} such sites across {phi_funcs} functions. "
+  "These are skip points where the no-op/effective status differs between keys A and B. Caveat: A and B each run a full "
+  "signing, so they also feed *different inputs* to the faulted function (different `c̃`, `μ`) -- a flip conflates genuine "
+  "key-dependence with ordinary input-dependence, so this *locates candidate sites* rather than proving SIFA-exploitability. "
+  "Publicness of the driving value does NOT rule a site out (SIFA exploits an ineffective-conditioned *bias*, which can arise "
+  "even for public operands); deciding each site needs the SIFA test proper (fix the key, fault across many inputs, filter to "
+  "the ineffective subset, test the conditional bias). The signal is heaviest in the NTT butterflies.")
 P("- The m4f optimising compiler **inlines 8 of the reference functions out of the signing path** "
   "(`polyveck_add/sub/chknorm/make_hint`, the `c·s` `*_pointwise_poly_montgomery` multiplies, "
   "`polyvecl_invntt_tomont`/`pointwise_acc`), so the ARM fault surface is **smaller** than the IR the LLVM tool "
@@ -173,9 +177,10 @@ for fn, a in sorted(_phi, key=lambda t: -t[1]["phi_sites"]):
         P(f"| ... | | +{len(d)-TOP} more sites |")
     P("")
 P("In `ntt` the φIF sites are the Montgomery-multiply butterfly ops (`smull`/`smlal`/`mul`/`add`): skipping one "
-  "is a no-op exactly when that key's coefficient makes the product irrelevant, so ineffectiveness tracks the "
-  "secret -- the key-dependent-ineffective surface the LLVM tool flags, here concentrated in the NTT rather than "
-  "the (inlined-away) `c·s` multiplies.\n")
+  "is a no-op exactly when that key's coefficient makes the product irrelevant, so the no-op pattern tracks the "
+  "(secret-derived) NTT operands -- the strongest φIF signal here, and the natural place for it since the `m4f` "
+  "compiler inlined the `c·s` `*_pointwise_poly_montgomery` multiplies away. Whether this is SIFA-exploitable still "
+  "needs the ineffective-conditioned-bias test (see caveat above).\n")
 
 P("## Per-function\n")
 P("| function | LLVM ineff | LLVM corr | ARM leak (LEAK/scored, max\\|t\\|) | ARM φIF sites (flips) | note |")

@@ -837,17 +837,18 @@ flagged none.
 \begin{table}[h]
 \centering\footnotesize
 \caption{Key-dependent-ineffective ($\varphi_{\mathrm{IF}}$) sites on the ARM skip
-surface, with the value that governs ineffectiveness. Only \code{ntt} is driven by a
-\emph{hidden} quantity; the rest key on values that are public.}
+surface, and the per-signing input whose value drives the no-op/effective split at
+each. (Whether a value is secret- or public-derived does \emph{not} by itself decide
+SIFA-exploitability; see text.)}
 \label{tab:phiif}
 \begin{tabular}{@{}lrl@{}}
 \toprule
-Function & $\varphi_{\mathrm{IF}}$ sites (flips) & Governing value \\
+Function & $\varphi_{\mathrm{IF}}$ sites (flips) & Input driving the split \\
 \midrule
-\code{ntt} & $63$ ($261$) & \textbf{secret-derived} (NTT of masked/secret polynomials) \\
-\code{poly\_challenge} & $5$ ($7$) & \emph{public}: $\tilde c$, published in $\sigma$ \\
-\code{polyvecl\_uniform\_gamma1} & $2$ ($38$) & secret: $y$ from $\rho'{=}H(K\,\|\,\mu)$ \\
-\code{poly\_chknorm} & $1$ ($1$) & public-ish: norm check of $z$ \\
+\code{ntt} & $63$ ($261$) & NTT of masked/secret polynomials (secret-derived) \\
+\code{poly\_challenge} & $5$ ($7$) & challenge seed $\tilde c = H(\mu\,\|\,w_1)$ (in $\sigma$) \\
+\code{polyvecl\_uniform\_gamma1} & $2$ ($38$) & mask $y$ from $\rho'{=}H(K\,\|\,\mu)$ \\
+\code{poly\_chknorm} & $1$ ($1$) & norm check of the response $z$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -858,24 +859,27 @@ only under a rare boundary condition---a redundant store, a dead write later
 overwritten, an unused sign bit. At \code{poly\_challenge}'s coefficient store
 \code{0x4122} the skip is \emph{effective} in $38/40$ messages for $A$ and $39/40$ for
 $B$; a flip needs one key to hit the rare no-op where the other does not, which occurs
-at just $3$ messages. Second---and more important for interpretation---the
-``key-dependence'' is really \emph{input}-dependence: changing the key changes the
-function's \emph{input}, and no-op-ness is a deterministic function of that input. For
-\code{poly\_challenge} the input is the challenge seed $\tilde c = H(\mu\,\|\,w_1)$;
-$w_1$ is secret-derived, so $A$ and $B$ feed \emph{different} $\tilde c$ (we confirm
-$\mathrm{gold}_A\neq\mathrm{gold}_B$ at every message) and the no-op boundary falls at
-different messages. But $\tilde c$ is \emph{published} in the signature
-$\sigma=(\tilde c, z, h)$: the ineffectiveness depends on a value the attacker already
-sees, so these sites are \emph{not} a secret oracle---they are SIFA false positives,
-as is \code{poly\_chknorm} (keyed on the norm check of the near-public $z$). The one
-surface where ineffectiveness tracks a \emph{hidden} quantity is \code{ntt}, whose
-operands are the NTT of secret/masked polynomials that are not directly published; and
-because the obvious $c\cdot s$ multiplies are inlined away, the genuine
-key-dependent-ineffective surface lands there, on the Montgomery butterflies
-(\code{smull}/\code{smlal}/\code{mul}/\code{add}). The corrected reading is therefore
-not ``SIFA is absent on the skip surface'' but ``key-dependent ineffectiveness is
-\emph{present} yet overwhelmingly \emph{public}-data-driven, with the NTT the lone
-secret-relevant site.''
+at just $3$ messages. Second, the metric must be read with care. A
+$\varphi_{\mathrm{IF}}$ flip only says the two keys' runs \emph{differed} in
+ineffectiveness at some message; but $A$ and $B$ each perform a full signing and
+therefore also feed \emph{different inputs} to the faulted function (different
+$\tilde c$, different $\mu$ via $\mathrm{tr}=H(pk)$), so a flip conflates genuine
+key-dependence with ordinary input-dependence. $\varphi_{\mathrm{IF}}$ thus
+\emph{locates candidate sites}; it does not, on its own, establish
+SIFA-exploitability. Crucially, exploitability is \emph{not} decided by whether the
+driving value is public: SIFA conditions on the ineffective faults and exploits a
+resulting \emph{bias} in an intermediate that correlates with the secret, and that
+bias can arise even when the faulted operand is entirely public---faulting the
+Fiat--Shamir challenge generation and filtering on valid signatures is itself a
+studied vector. Settling each site therefore needs the SIFA test proper: fix the
+secret, inject the fault across many inputs, filter to the ineffective subset, and
+test whether a target intermediate's \emph{conditional} distribution is biased toward
+secret-correlated states (\S\ref{sec:future}). What the present study does establish
+is a \emph{correction} to the earlier rate-based reading: key-dependent
+ineffectiveness is \emph{present} on the skip surface rather than absent, and it is
+heaviest in the NTT butterflies (\code{smull}/\code{smlal}/\code{mul}/\code{add}),
+where the \code{m4f} compiler relocated the secret arithmetic after inlining the
+$c\cdot s$ multiplies away.
 
 \subsection{MAYO: an honest negative result}
 On MAYO the whole-call sweep finds \emph{zero} leaking sites, and this is the correct
@@ -938,7 +942,7 @@ MAYO skip sweep (any site) & all $\leq 54\%$ / $0.0$ $\to$ none & oil leak is \G
 \code{sifa} / \code{r0\_reject} on the skip surface & $0$ flagged & need the data-fault surface (\code{SET\_MEM}/\code{BITFLIP}); skip-only hangs or yields no $r_0$ \\
 \code{poly\_chknorm} skip & crash/hang & stale verdict $\to$ infinite reject loop (not a leak) \\
 \code{per\_coord}/TVLA at the unfaulted control & $p\approx0.007$ (false positive) & small-$N$ normal tail is anti-conservative; tolerated for a detector framework \\
-\code{differential} / \code{sifa} across the skip sweep & $0$ new after FDR & the skip surface's only secret leak is the mask removal (\code{two\_key}'s); the direct $\varphi_{\mathrm{IF}}$ reading (\S\ref{sec:llvmstudy}) finds key-dependent ineffectiveness present but public-data-driven except in the NTT \\
+\code{differential} / \code{sifa} across the skip sweep & $0$ new after FDR & the skip surface's only \emph{correction} leak is the mask removal (\code{two\_key}'s); the direct $\varphi_{\mathrm{IF}}$ reading (\S\ref{sec:llvmstudy}) finds key-dependent ineffectiveness \emph{present} (heaviest in the NTT), though deciding SIFA-exploitability needs the ineffective-conditioned-bias test \\
 \bottomrule
 \end{tabular}
 \end{table}
