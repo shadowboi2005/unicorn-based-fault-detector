@@ -53,6 +53,7 @@ def arm_row(fn):
     # p for A and B now that the RNG is shared), does skipping flip between ineffective for one
     # key and effective for the other?  A site is phi_IF if >=1 such flip.
     phi_sites = phi_flips = 0
+    phi_detail = []                           # (pc_str, disasm, flips) per key-dependent-ineffective site
     for sd in sites:
         effA = {rec["idx"]: (rec["out"] != gold["A"][rec["idx"]])
                 for rec in sd.get("A", []) if rec["idx"] < len(gold["A"]) and gold["A"][rec["idx"]] is not None}
@@ -60,10 +61,14 @@ def arm_row(fn):
                 for rec in sd.get("B", []) if rec["idx"] < len(gold["B"]) and gold["B"][rec["idx"]] is not None}
         flips = sum(1 for i in (set(effA) & set(effB)) if effA[i] != effB[i])
         phi_flips += flips
-        if flips: phi_sites += 1
+        if flips:
+            phi_sites += 1
+            phi_detail.append((sd["pc"], sd["text"], flips))
+    phi_detail.sort(key=lambda t: -t[2])      # most key-dependent first
     leak_sites = [(r.addr, r.label, r.metric) for r in sorted(leaks, key=lambda r: r.addr)]
     return dict(scored=len(scored), leak=len(leaks), maxt=maxt, maxineff=maxineff,
-                phi_sites=phi_sites, phi_flips=phi_flips, leak_sites=leak_sites)
+                phi_sites=phi_sites, phi_flips=phi_flips, leak_sites=leak_sites,
+                phi_detail=phi_detail)
 
 def fmt(dt_): return f"{dt_[0]}/{dt_[1]}" if dt_ else "-"
 
@@ -125,7 +130,13 @@ P("- The m4f optimising compiler **inlines 8 of the reference functions out of t
   "(`polyveck_add/sub/chknorm/make_hint`, the `c·s` `*_pointwise_poly_montgomery` multiplies, "
   "`polyvecl_invntt_tomont`/`pointwise_acc`), so the ARM fault surface is **smaller** than the IR the LLVM tool "
   "analysed -- compilation itself changes what can be faulted.\n")
-P("## Where the key leaks (correction axis)\n")
+P("The two axes below come from **two different detectors** -- do not conflate them:\n")
+P("- **(A) distribution-difference** (`per_coord`/TVLA): the faulted *output distribution* differs by key")
+P("  (the *correction* analog -- a key LEAK).")
+P("- **(B) ineffective / φIF**: whether the skip is a *no-op* differs by key (the LLVM *ineffective* test).")
+P("  This is NOT a distribution test -- a site can be φIF with |t| at the no-leak floor, and vice-versa.\n")
+
+P("## (A) Distribution-difference detector -- where the output leaks by key (per_coord / TVLA)\n")
 _leakers = [(fn, a) for fn, l, note, a in rows if a is not None and a.get("leak_sites")]
 if _leakers:
     for fn, a in _leakers:
@@ -142,6 +153,30 @@ if _leakers:
       "floor seen at every other site.\n")
 else:
     P("No ARM function showed a LEAK site at FDR≤0.01.\n")
+
+P("## (B) Ineffective detector -- key-dependent ineffective (φIF) instructions\n")
+P("For each site below, there is a signed message where **skipping that single instruction is a no-op for one")
+P("key but changes the signature for the other** (A and B share message + RNG, so only `sk` differs). `flips` =")
+P("how many of the n=40 messages show that key-split. This is the LLVM *ineffective*-fault target; it is")
+P("independent of the TVLA LEAK above.\n")
+_phi = [(fn, a) for fn, l, note, a in rows if a is not None and a.get("phi_detail")]
+TOP = 20
+for fn, a in sorted(_phi, key=lambda t: -t[1]["phi_sites"]):
+    d = a["phi_detail"]
+    P(f"**`{fn}`** -- {a['phi_sites']} φIF site(s), {a['phi_flips']} total flips"
+      + (f" (top {TOP} by flips)" if len(d) > TOP else "") + ":\n")
+    P("| addr | flips | instruction |")
+    P("|---|---|---|")
+    for pc, text, flips in d[:TOP]:
+        P(f"| `{pc}` | {flips} | `{text}` |")
+    if len(d) > TOP:
+        P(f"| ... | | +{len(d)-TOP} more sites |")
+    P("")
+P("In `ntt` the φIF sites are the Montgomery-multiply butterfly ops (`smull`/`smlal`/`mul`/`add`): skipping one "
+  "is a no-op exactly when that key's coefficient makes the product irrelevant, so ineffectiveness tracks the "
+  "secret -- the key-dependent-ineffective surface the LLVM tool flags, here concentrated in the NTT rather than "
+  "the (inlined-away) `c·s` multiplies.\n")
+
 P("## Per-function\n")
 P("| function | LLVM ineff | LLVM corr | ARM leak (LEAK/scored, max\\|t\\|) | ARM φIF sites (flips) | note |")
 P("|---|---|---|---|---|---|")
@@ -152,18 +187,33 @@ for fn,l,note,a in rows:
     else:
         P(f"| `{fn}` | {li} | {lc} | {a['leak']}/{a['scored']}, |t|={a['maxt']:.1f} | {a['phi_sites']} ({a['phi_flips']}) | |")
 
-# plots: per-instruction ARM TVLA maps (built by scripts/plot_regions.py), leaker first
+# plots (built by scripts/plot_regions.py). Two SEPARATE detector views per function.
 PLOT_ORDER = ["polyvecl_add", "ntt", "invntt_tomont", "poly_uniform", "poly_decompose",
               "poly_make_hint", "poly_sub", "polyvec_matrix_pointwise_montgomery"]
-_plots = [fn for fn in PLOT_ORDER if os.path.exists(f"examples/plots/{fn}_by_instr.png")]
-if _plots:
+PHI_ORDER = ["ntt", "poly_challenge", "polyvecl_uniform_gamma1", "poly_chknorm"]
+_phi_plots = [fn for fn in PHI_ORDER if os.path.exists(f"examples/plots/{fn}_phi_by_instr.png")]
+_tvla_plots = [fn for fn in PLOT_ORDER if os.path.exists(f"examples/plots/{fn}_by_instr.png")]
+
+if _phi_plots or _tvla_plots:
     P("## Plots\n")
-    P("Per-instruction ARM TVLA maps (max\\|Welch t\\|, A vs B) across each function body, annotated with the")
-    P("function's LLVM-IR tainted-instruction count. **Red** = LEAK (FDR≤0.01), grey = no leak, light = skip-crash;")
-    P("the dashed line is the |t|≈4.5 flag threshold. Paths are relative to this file (`report/`).\n")
-    for fn in _plots:
+    P("Two detectors, two kinds of map (paths relative to this file, `report/`).\n")
+
+if _phi_plots:
+    P("### (B) Ineffective / φIF maps -- the detector of interest here\n")
+    P("Bar = how many of the n=40 messages have that single-instruction skip be a **no-op for one key but")
+    P("output-changing for the other** (key-dependent ineffectiveness). **Purple** = φIF site, grey = none.")
+    P("This is the *ineffective* axis -- NOT a distribution test.\n")
+    for fn in _phi_plots:
+        P(f"#### `pqcrystals_dilithium_{fn}` (φIF)\n")
+        P(f"![{fn} per-instruction φIF map](../examples/plots/{fn}_phi_by_instr.png)\n")
+
+if _tvla_plots:
+    P("### (A) Distribution-difference / TVLA maps (correction axis, for contrast)\n")
+    P("Per-instruction max\\|Welch t\\| (A vs B), annotated with the function's LLVM-IR tainted-instruction count.")
+    P("**Red** = LEAK (FDR≤0.01), grey = no leak, light = skip-crash; dashed line = |t|≈4.5 flag threshold.\n")
+    for fn in _tvla_plots:
         tag = " — the key leak (mask add `z=z+y`)" if fn == "polyvecl_add" else ""
-        P(f"### `pqcrystals_dilithium_{fn}`{tag}\n")
+        P(f"#### `pqcrystals_dilithium_{fn}`{tag}\n")
         P(f"![{fn} per-instruction TVLA](../examples/plots/{fn}_by_instr.png)\n")
 
 os.makedirs("report", exist_ok=True)
