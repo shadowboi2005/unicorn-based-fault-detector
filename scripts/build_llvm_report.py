@@ -2,9 +2,10 @@
 """Build report/llvm_vs_arm.md from the funcskip dumps under dumps/<fn>_instrskip/ and
 the LLVM-IR detection numbers transcribed from the Dilithium-LLVM summary image.
 
-ARM axes: leak/correction-analog = `per_coord` (TVLA) LEAK at FDR<=0.01; ineffective
-axis = max over sites of the fraction of skip-replays byte-identical to the unfaulted
-output; sifa z = key-dependence (2-proportion z) of that ineffective rate (A vs B).
+ARM axes: leak/correction-analog = `per_coord` (TVLA) LEAK at FDR<=0.01; φIF = the
+LLVM *ineffective* fault, i.e. KEY-DEPENDENT ineffectiveness -- per skip site, with A
+and B signing the same message + RNG (only sk differs), count sites where some message
+has the skip be a no-op for one key but output-changing for the other.
 """
 import os, json, sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -28,7 +29,6 @@ LLVM = {
  "polyvecl_uniform_eta":(1,1,1,1), "polyvecl_uniform_gamma1":(1,1,1,1),
  "signature_internal":(15,23,11,22),
 }
-INEFF_THRESH = 0.5   # a site counts as "ineffective-detected" if >=50% of its faults are no-ops
 
 # functions whose symbol exists but that the m4f SIGNING path never calls (inlined, or
 # only used in verify) -> read empirically from the capture manifest (A == 0)
@@ -82,10 +82,11 @@ corr_llvm=[(fn,a) for fn,l,a in reach if l[2]>0]
 ineff_llvm=[(fn,a) for fn,l,a in reach if l[0]>0]
 corr_arm=sum(1 for fn,a in corr_llvm if a["leak"]>0)
 ineff_arm_phi=sum(1 for fn,a in ineff_llvm if a["phi_sites"]>0)   # LLVM-ineffective fns with ARM phi_IF
-phi_funcs=sum(1 for fn,l,a in reach if a["phi_sites"]>0)          # any key-dependent-ineffective site
-phi_total=sum(a["phi_sites"] for fn,l,a in reach)
+reach_all=[(fn,a) for fn,l,n,a in rows if a is not None]          # every function with an ARM dump
+phi_funcs=sum(1 for fn,a in reach_all if a["phi_sites"]>0)        # any key-dependent-ineffective site
+phi_total=sum(a["phi_sites"] for fn,a in reach_all)
 arm_leakers=sorted(fn for fn,l,a in reach if a["leak"]>0)
-phi_fns=sorted((fn,a["phi_sites"]) for fn,l,a in reach if a["phi_sites"]>0)
+phi_fns=sorted(((fn,a["phi_sites"]) for fn,a in reach_all if a["phi_sites"]>0), key=lambda x:-x[1])
 
 out=[]
 P=out.append
@@ -95,9 +96,7 @@ P("via this platform's `funcskip` instruction-skip + detector repertoire.\n")
 P("- **LLVM** has two IR-fault tests: *ineffective* (SIFA-style no-op faults) and *correction*")
 P("  (output-changing faults). Numbers (detected/total) are transcribed from the project's summary image.")
 P("- **ARM** (n=40/key): *leak* = `per_coord`/TVLA sites flagged LEAK at FDR≤0.01 (the correction")
-P("  analog); *ineffective* = max over sites of the share of skip-replays byte-identical to the")
-P(f"  unfaulted output; *sifa z* = key-dependence of that rate. A function counts as ARM-ineffective-")
-P(f"  detected when that max fraction ≥ {INEFF_THRESH}.")
+P("  analog); *φIF* = number of skip sites that are **key-dependent ineffective** (defined below).")
 P("- Fault models differ (IR bit/value faults vs whole-instruction skip), and funcskip captures")
 P("  only functions **reached during signing**, so this is a *translation* study, not 1:1.\n")
 P("The **ineffective test is φIF** -- a *key-dependent* ineffective fault: ∃ public `p`, ∃ secrets")
@@ -110,7 +109,7 @@ P(f"- **Correction → ARM leak:** {corr_arm}/{len(corr_llvm)} of LLVM-correctio
   f"(the ARM leakers: {', '.join('`%s`'%x for x in arm_leakers) or 'none'}).")
 P(f"- **Ineffective (φIF) → ARM φIF:** {ineff_arm_phi}/{len(ineff_llvm)} of LLVM-ineffective-flagged functions have a "
   f"**key-dependent ineffective** site on ARM.")
-P(f"- Across all {len(reach)} reachable functions: **{phi_funcs}** have ≥1 φIF site "
+P(f"- Across all {len(reach_all)} reachable functions: **{phi_funcs}** have ≥1 φIF site "
   f"(**{phi_total}** key-dependent-ineffective sites in total)"
   + (": " + ", ".join(f"`{fn}`({n})" for fn,n in phi_fns) if phi_fns else "") + ".\n")
 P("## Takeaways\n")

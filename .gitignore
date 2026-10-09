@@ -16,3 +16,5 @@ firmware/*.bin
 /dumps/
 *_instrskip/
 funcskip_sweep/
+# persistent funcskip capture cache (ucpqc capture --out); regenerable, ~20MB
+/captures/
