@@ -272,7 +272,7 @@ def _emit(args, result):
 
 def cmd_sweep(args):
     """Whole-call fault sweep over the operation's inner loop (ALAFA-style)."""
-    if args.jobs != 1:                            # parallel (multiprocessing) path
+    if args.jobs != 1:                            # parallel (threaded, free-threaded 3.14t) path
         from . import parallel
         result = parallel.sweep_sites_parallel(
             args.elf, platform_name=args.platform, n=args.n,
@@ -512,7 +512,8 @@ def build_parser():
                         "item) as JSON to DIR (default 'dump'), for offline replay with "
                         "`ucpqc detect` -- no re-emulation")
     p.add_argument("-j", "--jobs", type=int, default=1,
-                   help="parallel worker processes (1=serial, 0=auto/all CPUs)")
+                   help="worker threads (1=serial, 0=all CPUs; parallelizes the fault "
+                        "sites, best on the free-threaded 3.14t interpreter)")
     _add_calibration_flags(p)
     p.set_defaults(handler=cmd_sweep)
 

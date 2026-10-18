@@ -1,22 +1,30 @@
-# Free-threaded parallel sweep (`parallel-freethreading` branch)
+# Free-threaded parallelism (`-j`)
 
-This branch parallelises the fault sweep with **real threads on a no-GIL CPython
-3.14t** build. The sweep/replay engine is unchanged on `master`; this branch adds
-one file (`ucpqc/parallel.py`, a `ThreadPoolExecutor` backend) plus a `-j/--jobs`
-flag on the `sweep`/`funcskip` CLI commands. `-j1` is the untouched serial path;
-`-j N` (or `-j0` = all CPUs) runs the thread backend.
+Both sweep modes parallelise with **real threads on a no-GIL CPython 3.14t**
+build. `-j1` (the default) is the untouched serial path; `-j N` (or `-j0` = all
+CPUs) runs the thread backend. On a GIL build the threaded paths still give the
+same results, just serially (`sweep -j` prints a warning).
+
+| command | module | what is split across threads | parity test |
+|---|---|---|---|
+| `sweep -j N` | `ucpqc/parallel.py` | the whole-call fault sites (one task per site, `as_completed`) | `test_parallel_sweep_matches_serial` — bit-identical to serial |
+| `funcskip -j N` | `ucpqc/parallel_funcskip.py` | both phases: the 2N capture signings *and* the skip-site replays | `test_funcskip_parallel_jobs_invariant` — `jobs=1` ≡ `jobs=K` |
 
 Because a Unicorn `Uc` is stateful, threads don't *share* a machine — each worker
-thread builds its own from the ELF path (held in a `threading.local`), exactly
-like the process backend's per-worker initializer. The win over processes is that
-nothing is pickled: the read-only inputs (keys, messages, captures) are shared in
-memory. Results are **bit-identical** to the serial engine (asserted by
-`tests/run_tests.py::test_parallel_sweep_matches_serial`).
+thread builds its own from the ELF path (held in a `threading.local`). Nothing is
+pickled: the read-only inputs (keys, messages, captures, golden baseline) are
+shared in memory.
 
-See the sibling `parallel-multiprocessing` branch for the `ProcessPoolExecutor`
-backend (works on stock 3.12, no interpreter change).
+`funcskip -j` makes each capture signing an order-free unit (fresh post-setup
+snapshot + per-`(key, index)` RNG seed), so its dumps are identical for any `-j`,
+but its nonces differ from the serial (`-j1`, single RNG stream) capture — compare
+verdicts, not raw outputs, across the two. It uses the `call` backend.
 
-## Result
+A `ProcessPoolExecutor` alternative (works on stock 3.12, ~11× the memory at
+`-j20`, see `examples/plots/9/09.md`) lives on the unmerged
+`parallel-multiprocessing` branch.
+
+## Result (`sweep -j`)
 
 - **Spike (the go/no-go):** 8 threads, each a full ML-DSA signing, 1.93 s → 0.43 s
   (~4×), with `sys._is_gil_enabled()` staying `False` and threaded outputs equal
@@ -26,6 +34,9 @@ backend (works on stock 3.12, no interpreter change).
   site, not the site count (see `examples/plots/9/09.md`).
 
 ## Setting up the 3.14t venv
+
+`scripts/setup_env.sh --ft` does all of the below and builds `.venv314t`; the run
+scripts pick it up automatically. The manual steps, for reference:
 
 The one non-obvious dependency is **unicorn**. It is a ctypes binding around a
 bundled `libunicorn.so` (no CPython extension module), so the 2.1.4 package files
@@ -49,5 +60,6 @@ trips `py_limited_api` + `bdist_wheel` (setuptools#4420). So:
    `sysconfig.get_config_var("Py_GIL_DISABLED")` is set (the upstream fix). Verify:
    `python -c "import unicorn; print(unicorn.__version__)"  # 2.1.4`.
 
-Then `python -m ucpqc sweep <elf> --n 12 -j20` and
+Then `python -m ucpqc sweep <elf> --n 12 -j20`,
+`python -m ucpqc funcskip <elf> --target ntt --n 24 -j20 --dumpdir runs/dumps`, and
 `python tests/run_tests.py` on that interpreter.
