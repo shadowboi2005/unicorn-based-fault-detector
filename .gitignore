@@ -1,4 +1,5 @@
 .venv/
+.venv314t/
 __pycache__/
 *.pyc
 
