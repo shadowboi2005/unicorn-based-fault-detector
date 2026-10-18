@@ -765,7 +765,8 @@ def sweep_function(scheme, profile, target=None, keys=DEFAULT_KEYS, n=DEFAULT_N,
             status = "LEAK" if r.get("leak") else "ok"
         else:
             status = "pending"                    # finalized by the sweep-wide FDR pass
-        row = SiteResult(r["pc"], r["text"], metric, status, ran, crashed, pvalue=pvalue)
+        row = SiteResult(r["pc"], r["text"], metric, status, ran, crashed, pvalue=pvalue,
+                         ineffective=r.get("ineffective"))
         rows.append(row)
         if progress:
             progress(row)
@@ -780,11 +781,19 @@ def sweep_function(scheme, profile, target=None, keys=DEFAULT_KEYS, n=DEFAULT_N,
                 "detector": detector, "n": n, "key_mode": key_mode, "backend": backend,
                 "out_kind": "ret" if target.out == "ret" else "buffer",
                 "sites": [{"pc": s["pc"], "text": s["text"]} for s in sites]}
-        caps = {k: [[int(x) for x in c.c] for c in caps_by_key.get(k, [])] for k in ("A", "B")}
+        caps = {k: [_cap_record(c) for c in caps_by_key.get(k, [])] for k in ("A", "B")}
         dumpmod.write_funcskip_dump(dump, meta, caps, sites)
     return AssessmentResult(scheme.name, "funcskip", detector, n, rows,
                             calibrate=calibrate, fdr_q=fdr_q, correction=correction,
                             n_perm=n_perm, key_mode=key_mode)
+
+
+def _cap_record(cap):
+    """Serialize one capture's per-item context for a funcskip dump: the challenge and the
+    UNFAULTED output (so the ineffective-fault / SIFA axis is computable offline)."""
+    g = cap.golden_output
+    return {"challenge": [int(x) for x in cap.c],
+            "golden": g.hex() if isinstance(g, (bytes, bytearray)) else g}
 
 
 def assess_funcskip_from_dump(dump_dir, detector=None, calibrate=True,
@@ -799,16 +808,26 @@ def assess_funcskip_from_dump(dump_dir, detector=None, calibrate=True,
     profile = profile_by_name(meta["scheme"])
     detector = detector or meta["detector"]
     buffer = meta.get("out_kind", "buffer") == "buffer"
-    caps_c = {k: [np.array(c, float) for c in caps.get(k, [])] for k in ("A", "B")}
+    # caps.json is a list of {challenge, golden} dicts (older dumps: a bare challenge list)
+    caps_c = {k: [np.array(r["challenge"] if isinstance(r, dict) else r, float)
+                  for r in caps.get(k, [])] for k in ("A", "B")}
+    golden = {k: [(r.get("golden") if isinstance(r, dict) else None)
+                  for r in caps.get(k, [])] for k in ("A", "B")}
 
     rows = []
     for sd in sites:
         feats = {"A": [], "B": []}
+        same = total = 0                                   # ineffective: faulted == unfaulted
         for k in ("A", "B"):
             for rec in sd.get(k, []):
+                i = rec["idx"]
                 out = bytes.fromhex(rec["out"]) if buffer else int(rec["out"])
-                cc = caps_c[k][rec["idx"]] if rec["idx"] < len(caps_c[k]) else None
+                cc = caps_c[k][i] if i < len(caps_c[k]) else None
                 feats[k].append(_funcskip_feature(profile, detector, cc, out))
+                g = golden[k][i] if i < len(golden[k]) else None
+                if g is not None:
+                    total += 1
+                    same += (rec["out"] == g)              # compare in stored form (hex / int)
         metric, pvalue = _score_and_pvalue(detector, feats, profile, calibrate, n_perm)
         ran = len(feats["A"]) + len(feats["B"])
         if ran < 3 or metric is None:
@@ -818,7 +837,7 @@ def assess_funcskip_from_dump(dump_dir, detector=None, calibrate=True,
         else:
             status = "pending"
         rows.append(SiteResult(int(sd["pc"], 16), sd["text"], metric, status, ran, 0,
-                               pvalue=pvalue))
+                               pvalue=pvalue, ineffective=(same / total if total else None)))
     if calibrate:
         _apply_correction(rows, fdr_q, correction)
     return AssessmentResult(meta["scheme"], "funcskip", detector, meta["n"], rows,

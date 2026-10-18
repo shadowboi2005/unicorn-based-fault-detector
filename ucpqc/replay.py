@@ -313,6 +313,7 @@ def _replay_site(machine, target, spec, captures_by_key, featurize, detect,
     _, _, text = machine.disasm_one(spec.pc)
     feats = {k: [] for k in keys}
     crashed = ran = 0
+    ineff_same = ineff_total = 0                      # ineffective fault: faulted == unfaulted
     for k in keys:
         for cap_i, cap in enumerate(captures_by_key[k]):
             out = replay(machine, target, cap, spec, backend, budget)
@@ -323,7 +324,11 @@ def _replay_site(machine, target, spec, captures_by_key, featurize, detect,
                 if on_output is not None:
                     on_output(spec.pc, text, k, cap_i, out)
                 feats[k].append(featurize(cap, out))
-    row = {"pc": spec.pc, "text": text, "crashed": crashed, "ran": ran}
+                if cap.golden_output is not None:
+                    ineff_total += 1
+                    ineff_same += (out == cap.golden_output)
+    row = {"pc": spec.pc, "text": text, "crashed": crashed, "ran": ran,
+           "ineffective": (ineff_same / ineff_total if ineff_total else None)}
     try:
         row.update(detect(feats))
     except Exception as exc:             # too few survivors, etc.

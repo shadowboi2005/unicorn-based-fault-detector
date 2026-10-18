@@ -673,7 +673,9 @@ def test_funcskip_dump_matches_live():
     for a in set(lv) & set(ov):
         assert (lv[a].metric, lv[a].pvalue, lv[a].status) == \
                (ov[a].metric, ov[a].pvalue, ov[a].status), f"row mismatch at {a:#x}"
+        assert lv[a].ineffective == ov[a].ineffective, f"ineffective mismatch at {a:#x}"
     assert {r.addr for r in live.leaks()} == {r.addr for r in off.leaks()}
+    assert any(r.ineffective is not None for r in off.rows), "ineffective axis is populated"
 
 
 def test_funcskip_parallel_jobs_invariant():
@@ -701,6 +703,11 @@ def test_funcskip_dumpdir_resolves():
     out = os.path.join(base, "polyvecl_add_instrskip")
     assert os.path.isdir(out), f"expected dump dir {out}"
     assert os.path.exists(os.path.join(out, "meta.json")), "meta.json written under the base dir"
+    # the dump carries golden outputs, so the candidate counter can score phi_IF from it
+    from ucpqc import candidates
+    c = candidates.candidate_counts(base)["polyvecl_add"]
+    assert c["reached"] and c["scored"] > 0, f"candidate counts read the dump: {c}"
+    assert c["maxineff"] > 0, "ineffective axis populated from the dump's golden outputs"
 
 
 # --- runner -----------------------------------------------------------------
