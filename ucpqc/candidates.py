@@ -69,6 +69,11 @@ def counts_for_dump(dump_dir, detector="per_coord"):
     maxt = max((r.metric for r in scored), default=0.0)
     maxineff = max((r.ineffective for r in res.rows if r.ineffective is not None), default=0.0)
     _, caps, sites = dumpmod.load_funcskip_dump(dump_dir)
+    recs = caps.get("A", []) + caps.get("B", [])
+    if recs and not any(isinstance(r, dict) and r.get("golden") is not None for r in recs):
+        # older dumps stored bare challenges, no unfaulted output: phi_IF would silently be 0
+        raise ValueError(f"{dump_dir}: dump has no golden (unfaulted) outputs, so phi_IF "
+                         "cannot be counted -- re-run funcskip --dump with this version")
     phi_sites, phi_flips, phi_detail = _phi_counts(caps, sites)
     leak_sites = [(r.addr, r.label, r.metric) for r in sorted(leaks, key=lambda r: r.addr)]
     return dict(scored=len(scored), leak=len(leaks), maxt=maxt, maxineff=maxineff,
