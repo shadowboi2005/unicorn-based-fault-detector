@@ -95,6 +95,11 @@ class Trigger:
             if self.on_arm:
                 self.on_arm(m)
 
+    @property
+    def ret(self):
+        """Return address captured at entry of the currently-armed invocation."""
+        return self._ret
+
     def detach(self):
         self.machine.unhook(self._handle)
 

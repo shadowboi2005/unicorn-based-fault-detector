@@ -154,7 +154,7 @@ class Recorder:
     def _on_arm(self, mm):
         self._count += 1
         if self._is_target(self._count):
-            self._pending = self._grab_entry(mm, self._trig._ret)
+            self._pending = self._grab_entry(mm, self._trig.ret)
 
     def _on_disarm(self, mm):
         if self._pending is not None:
