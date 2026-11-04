@@ -191,11 +191,11 @@ class Recorder:
     def _on_arm(self, mm):
         if self._caller is not None:                 # count only calls from `caller`
             lo, hi = self._caller
-            if not lo <= self._trig._ret < hi:
+            if not lo <= self._trig.ret < hi:
                 return
         self._count += 1
         if self._is_target(self._count):
-            self._pending = self._grab_entry(mm, self._trig._ret)
+            self._pending = self._grab_entry(mm, self._trig.ret)
 
     def _on_disarm(self, mm):
         if self._pending is not None:

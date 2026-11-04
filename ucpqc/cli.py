@@ -272,7 +272,16 @@ def _emit(args, result):
 
 def cmd_sweep(args):
     """Whole-call fault sweep over the operation's inner loop (ALAFA-style)."""
-    m, scheme = _machine(args)
+    if args.jobs != 1:                            # parallel (threaded, free-threaded 3.14t) path
+        from . import parallel
+        result = parallel.sweep_sites_parallel(
+            args.elf, platform_name=args.platform, n=args.n,
+            detector=args.detector, jobs=args.jobs, seed=args.seed.encode(),
+            profile_override=getattr(args, "profile", None),
+            calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
+            fdr_q=args.fdr, correction=args.correction, key_mode=args.key_mode)
+        return _emit(args, result)
+    m, scheme = _machine(args)                    # serial reference path
     profile = _profile(args, scheme)
     result = assessmod.sweep_sites(scheme, profile, n=args.n, detector=args.detector,
                                    calibrate=not args.legacy_thresholds, n_perm=args.n_perm,
@@ -411,26 +420,21 @@ def _add_scoring_flags(p):
                         "with no permutation and no FDR pass")
 
 
-def build_parser():
-    parser = argparse.ArgumentParser(
-        prog="ucpqc",
-        description="Unicorn-based emulation of post-quantum crypto firmware "
-        "(CRYSTALS-Dilithium and friends) on Cortex-M4.",
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
+def _add_common_elf_args(p, op_default=None):
+    """The ELF + emulation flags shared by every command that boots firmware."""
+    p.add_argument("elf", help="firmware ELF to emulate")
+    p.add_argument("--platform", default="mps2-an386", choices=sorted(PLATFORMS))
+    p.add_argument("--seed", default="ucpqc", help="seed for the stubbed RNG")
+    p.add_argument("--message", default="ucpqc", help="message to sign")
+    if op_default:
+        p.add_argument(
+            "--op",
+            default=op_default,
+            help="operation to drive: keypair, sign/enc, verify/dec, roundtrip",
+        )
 
-    def add_elf(p, op_default=None):
-        p.add_argument("elf", help="firmware ELF to emulate")
-        p.add_argument("--platform", default="mps2-an386", choices=sorted(PLATFORMS))
-        p.add_argument("--seed", default="ucpqc", help="seed for the stubbed RNG")
-        p.add_argument("--message", default="ucpqc", help="message to sign")
-        if op_default:
-            p.add_argument(
-                "--op",
-                default=op_default,
-                help="operation to drive: keypair, sign/enc, verify/dec, roundtrip",
-            )
 
+def _add_build_parser(sub):
     p = sub.add_parser("build", help="build a scheme from pqm4 and stage it")
     p.add_argument("scheme", help="e.g. crypto_sign/ml-dsa-44/m4f")
     p.add_argument("--pqm4", default=DEFAULT_PQM4)
@@ -440,21 +444,29 @@ def build_parser():
     p.add_argument("--jobs", type=int, default=None)
     p.set_defaults(handler=cmd_build)
 
+
+def _add_schemes_parser(sub):
     p = sub.add_parser("schemes", help="list schemes available in a pqm4 tree")
     p.add_argument("pattern", nargs="?", default="")
     p.add_argument("--pqm4", default=DEFAULT_PQM4)
     p.set_defaults(handler=cmd_schemes)
 
+
+def _add_info_parser(sub):
     p = sub.add_parser("info", help="show the scheme binding and memory map")
-    add_elf(p)
+    _add_common_elf_args(p)
     p.set_defaults(handler=cmd_info)
 
+
+def _add_symbols_parser(sub):
     p = sub.add_parser("symbols", help="list symbols in the firmware")
     p.add_argument("elf")
     p.add_argument("pattern", nargs="?", default="*")
     p.add_argument("--all", action="store_true", help="include data symbols")
     p.set_defaults(handler=cmd_symbols)
 
+
+def _add_run_parser(sub):
     p = sub.add_parser("run", help="boot the firmware and print its output")
     p.add_argument("elf")
     p.add_argument("--platform", default="mps2-an386", choices=sorted(PLATFORMS))
@@ -462,24 +474,32 @@ def build_parser():
     p.add_argument("--stream", action="store_true", help="print UART output live")
     p.set_defaults(handler=cmd_run)
 
+
+def _add_roundtrip_parser(sub):
     p = sub.add_parser("roundtrip", help="run one keygen/sign/verify (or KEM) cycle")
-    add_elf(p)
+    _add_common_elf_args(p)
     p.set_defaults(handler=cmd_roundtrip)
 
+
+def _add_profile_parser(sub):
     p = sub.add_parser("profile", help="instruction counts per function")
-    add_elf(p, op_default="sign")
+    _add_common_elf_args(p, op_default="sign")
     p.add_argument("--top", type=int, default=25)
     p.set_defaults(handler=cmd_profile)
 
+
+def _add_calls_parser(sub):
     p = sub.add_parser("calls", help="call tree with per-call instruction cost")
-    add_elf(p, op_default="sign")
+    _add_common_elf_args(p, op_default="sign")
     p.add_argument("--depth", type=int, default=6)
     p.add_argument("--lines", type=int, default=60)
     p.add_argument("--min-cost", type=int, default=0, dest="min_cost")
     p.set_defaults(handler=cmd_calls)
 
+
+def _add_trace_parser(sub):
     p = sub.add_parser("trace", help="instruction or memory trace of one function")
-    add_elf(p, op_default="sign")
+    _add_common_elf_args(p, op_default="sign")
     p.add_argument("--func", help="restrict to this function (or a landmark: ntt, keccak, ...)")
     p.add_argument("--mem", action="store_true", help="trace memory accesses instead")
     p.add_argument("--regs", action="store_true", help="include register state")
@@ -495,8 +515,10 @@ def build_parser():
     p.add_argument("--csv")
     p.set_defaults(handler=cmd_trace)
 
+
+def _add_fault_parser(sub):
     p = sub.add_parser("fault", help="run a fault-injection campaign")
-    add_elf(p)
+    _add_common_elf_args(p)
     p.add_argument("--func", required=True, help="function to attack (or a landmark)")
     p.add_argument("--model", default=faultmod.SKIP, choices=faultmod.MODELS)
     p.add_argument("--stride", type=int, default=1, help="step between fault sites")
@@ -519,9 +541,11 @@ def build_parser():
     )
     p.set_defaults(handler=cmd_fault)
 
+
+def _add_sweep_parser(sub):
     p = sub.add_parser("sweep", help="whole-call fault sweep over the signing loop "
                        "(ALAFA-style two-key leak test)")
-    add_elf(p)
+    _add_common_elf_args(p)
     p.add_argument("--n", type=int, default=24, help="signatures per key")
     p.add_argument("--detector", default="per_coord",
                    choices=("two_key", "per_coord", "subspace", "structural", "mmd",
@@ -532,9 +556,14 @@ def build_parser():
                    help="also write the golden + faulty runs (artifact + challenge per "
                         "item) as JSON to DIR (default 'dump'), for offline replay with "
                         "`ucpqc detect` -- no re-emulation")
+    p.add_argument("-j", "--jobs", type=int, default=1,
+                   help="worker threads (1=serial, 0=all CPUs; parallelizes the fault "
+                        "sites, best on the free-threaded 3.14t interpreter)")
     _add_calibration_flags(p)
     p.set_defaults(handler=cmd_sweep)
 
+
+def _add_detect_parser(sub):
     p = sub.add_parser("detect", help="re-run a detector on a dumped sweep or funcskip "
                        "capture (`--dump`) offline -- no emulator")
     p.add_argument("dumpdir", help="dump directory written by `sweep --dump` or `funcskip --dump`")
@@ -545,9 +574,11 @@ def build_parser():
     _add_scoring_flags(p)
     p.set_defaults(handler=cmd_detect)
 
+
+def _add_funcskip_parser(sub):
     p = sub.add_parser("funcskip", help="instruction-skip sweep inside one function "
                        "(capture-and-replay)")
-    add_elf(p)
+    _add_common_elf_args(p)
     p.add_argument("--target", help="named funcskip target (default: the profile's)")
     p.add_argument("--n", type=int, default=24, help="signatures per key")
     p.add_argument("--detector", default=None,
@@ -580,10 +611,12 @@ def build_parser():
     _add_calibration_flags(p)
     p.set_defaults(handler=cmd_funcskip)
 
+
+def _add_capture_parser(sub):
     p = sub.add_parser("capture", help="build a persistent funcskip capture cache "
                        "(one 2N-signing pass over all targets) for reuse with "
                        "`funcskip --captures`")
-    add_elf(p)
+    _add_common_elf_args(p)
     p.add_argument("--out", default="captures", metavar="DIR",
                    help="directory to write the capture cache into (default captures/)")
     p.add_argument("--target", help="capture only this target (default: every profile target)")
@@ -594,6 +627,28 @@ def build_parser():
     p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
     p.set_defaults(handler=cmd_capture)
 
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="ucpqc",
+        description="Unicorn-based emulation of post-quantum crypto firmware "
+        "(CRYSTALS-Dilithium and friends) on Cortex-M4.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    _add_build_parser(sub)
+    _add_schemes_parser(sub)
+    _add_info_parser(sub)
+    _add_symbols_parser(sub)
+    _add_run_parser(sub)
+    _add_roundtrip_parser(sub)
+    _add_profile_parser(sub)
+    _add_calls_parser(sub)
+    _add_trace_parser(sub)
+    _add_fault_parser(sub)
+    _add_sweep_parser(sub)
+    _add_detect_parser(sub)
+    _add_funcskip_parser(sub)
+    _add_capture_parser(sub)
     return parser
 
 
