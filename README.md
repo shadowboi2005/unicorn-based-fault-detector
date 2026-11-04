@@ -52,31 +52,50 @@ python -m ucpqc profile   fw.elf --op sign --top 15
 python -m ucpqc calls     fw.elf --op keypair --depth 4
 python -m ucpqc trace     fw.elf --func ntt --scope body --csv ntt.csv
 python -m ucpqc fault     fw.elf --func challenge --model skip --hit 2 --csv faults.csv
-python -m ucpqc sweep     fw.elf --n 24                    # whole-call leak sweep (ALAFA)
-python -m ucpqc funcskip  fw.elf --target polyvecl_add     # intra-function skip sweep
+python -m ucpqc sweep     fw.elf --n 24 --dump dump       # whole-call leak sweep (ALAFA), + dump
+python -m ucpqc funcskip  fw.elf --target polyvecl_add    # intra-function skip sweep
+python -m ucpqc capture   fw.elf --n 40 --out captures    # one signing pass -> reusable cache
+python -m ucpqc funcskip  fw.elf --target poly_add --captures captures --dumpdir dumps  # replay, no re-sign
+python -m ucpqc detect    dumps/poly_add_instrskip --detector per_coord    # re-score offline, no emulator
+python -m ucpqc phi       fw.elf --sites polyvecl_add,poly_challenge        # per-position phi_IF (ineffective)
 python -m ucpqc build     crypto_kem/ml-kem-768/m4fspeed
 python -m ucpqc schemes   dilithium         # what is available in the pqm4 tree
 ```
+
+**Capture once, replay many.** The expensive part of `funcskip` is the 2N signings
+it captures; `ucpqc capture` does that **once** for every target and saves a cache, so
+`funcskip --captures DIR` (and reruns, across sessions) replay with no re-signing.
+`--dump`/`--dumpdir` then persist the per-site faulted outputs + the unfaulted baseline,
+so `ucpqc detect` re-scores any detector **offline** (no emulator). Convenience wrappers
+for all of this live in [`scripts/`](scripts/README.md) (`capture.sh`, `run_funcskip.sh`,
+`detect.sh`, `run_sweep.sh`, …).
 
 `sweep` and `funcskip` are the two **fault-leakage assessment modes** — they ask
 whether a *fault* makes the output leak the secret key (no side-channel traces
 are involved).  `sweep` skips each whole operation call in the signing loop —
 its sites are **auto-discovered** by disassembling the resolved signing function
-(no per-firmware address table) — and runs a two-key test on the released
-signatures (only `z = z + y` leaks, at 100%).  `funcskip` skips every
+(no per-firmware address table) — and runs the `per_coord` TVLA test on the
+released signatures (only `z = z + y` leaks, at 100%).  `funcskip` skips every
 instruction *inside* one function by capturing its I/O once and replaying just
 that function per trial (~240x cheaper than re-signing).  Both auto-select an
-**analysis profile** from the scheme (`--profile` to override, `--detector` to
-force `two_key`/`per_coord`/`subspace`/`structural`/`mmd`/`uniformity`/`spec_aware`,
-`--plot DIR` to render a bar chart).
+**analysis profile** from the scheme (`--profile` to override; `--plot DIR` to
+render a bar chart).
 
-**Calibrated verdicts.** A LEAK is not a hand-tuned cutoff: each site's detector
-statistic becomes a **per-site p-value** (a key-label permutation test for the
-classifier/structural detectors — `--n-perm`, default 1000; an exact analytic tail
-for `per_coord`/`uniformity`), and a **sweep-wide Benjamini–Hochberg** pass
-(`--fdr`, default 0.01; `--correction holm` for family-wise error) flags leaks with
-a false-discovery guarantee across all swept sites — so there is nothing per-scheme
-to tune. `--legacy-thresholds` restores the old fixed cutoffs (0.80 / 0.50 / 0.10).
+**Two detectors (instruction-skip scope).** The platform keeps exactly two,
+one per leak axis (see [`report/detector_inventory.md`](report/detector_inventory.md)):
+`per_coord` (the correction/output-leak axis, used by `sweep`/`funcskip`) and the
+per-position **`phi`** detector (the key-dependent-ineffective / SIFA-candidate
+axis, its own subcommand).  The richer detectors that targeted fault models this
+platform does not run (two_key/subspace/structural/mmd/uniformity/spec_aware/
+differential and the old whole-output `sifa`) were removed and are restorable from
+git history.
+
+**Calibrated verdicts.** A LEAK is not a hand-tuned cutoff: each `per_coord` site's
+max‑|t| becomes a **per-site p-value** (the exact Bonferroni TVLA tail), and a
+**sweep-wide Benjamini–Hochberg** pass (`--fdr`, default 0.01; `--correction holm`
+for family-wise error) flags leaks with a false-discovery guarantee across all
+swept sites — so there is nothing per-scheme to tune. `--legacy-thresholds` restores
+the old fixed per-site cutoff.
 
 `--func` accepts a symbol name or one of the landmarks the framework resolves
 per scheme family (`ntt`, `invntt`, `challenge`, `decompose`, `keccak`).
@@ -117,7 +136,8 @@ transformed = struct.unpack("<256i", m.read(poly, 1024))
 | `FaultCampaign` | sweep of fault models, classified against a golden run | one run per trial |
 | `assess.sweep_sites` | whole-call leak sweep of the operation loop (mode `sweep`) | one op per trial |
 | `assess.sweep_function` | intra-function instruction-skip sweep via capture-replay (mode `funcskip`) | one function per trial |
-| `detectors` | two-key classifier, TVLA t-test, MMD, uniformity, band tests | — |
+| `phi.per_position_phi` | per-position key-dependent-ineffective detector (SIFA candidates) | K keygens × signings |
+| `detectors` | `per_coord` TVLA (matched filter + `tvla_max`) + BH/Holm corrections | — |
 
 Faults are a `FaultSpec` (what) plus a trigger (when): `at=` a global
 instruction index, or `pc=` a symbol/address on its `hit`-th execution. Models
@@ -208,20 +228,17 @@ function (base-class default) — override only for curated/filtered sites.
 
 | detector | what the profile must add | example |
 |---|---|---|
-| `two_key` / `per_coord` / `subspace` | `challenge`, `response_from_*`, `feature` (a real-valued, ideally leak-aligned feature — e.g. Dilithium's matched filter) | `MLDSAProfile.feature` |
-| `uniformity` / `spec_aware` | the raw-coefficient response + the relevant bound (`reject_bound`) | `MLDSAProfile.reject_bound` |
-| `structural` (field-aware) | `field` (a `detectors.Field`: `PrimeField(q)`, `GF2m(m)`, …) **and** `structural_feature(context, response)` returning a row of **field elements** built so a leak shows as a low-rank, key-dependent subspace | `MLDSAProfile` (`PrimeField(Q)` + `s1` deconvolution), `MayoProfile` (`GF2m(4)` + oil bytes) |
+| `per_coord` (`sweep`/`funcskip`) | `challenge`, `response_from_*`, `feature` (a real-valued, ideally leak-aligned feature — e.g. Dilithium's matched filter) | `MLDSAProfile.feature` |
+| `phi` (per-position phi_IF) | nothing required to *locate* witnesses; `secret_coeffs(sk)` optionally attributes a flagged position to a secret coefficient | `MLDSAProfile.secret_coeffs` (s1) |
 | `funcskip` mode | `targets()` / `default_target` (a `replay.Target`: function, arg layout, output) | `MLDSAProfile.targets` |
 
-`challenge`/`response_from_*`/`feature` are the minimum to run any two-key-family
-sweep; `field`+`structural_feature` are the extra pair for the field-aware
-structural detector, and `targets()` is the extra piece for the intra-function
-`funcskip` mode. Everything else (fault-site discovery, the mode engine, the
-detectors themselves) is scheme-agnostic. A new scheme supplies **no thresholds**:
-the LEAK verdict is calibrated (permutation/analytic p-value + sweep-wide FDR), so
-the cutoffs are not per-scheme knobs. The **structural feature is where the
-scheme's algebra enters** — it is the piece expected to be supplied per scheme
-when scanning it (the framework does not infer the leak's algebraic form).
+`challenge`/`response_from_*`/`feature` are the minimum to run a `per_coord`
+sweep; `secret_coeffs` is the optional attribution hook for `phi`; and `targets()`
+is the extra piece for the intra-function `funcskip` mode. Everything else
+(fault-site discovery, the mode engine, the detectors themselves) is
+scheme-agnostic. A new scheme supplies **no thresholds**: the LEAK verdict is
+calibrated (analytic p-value + sweep-wide FDR), so the cutoffs are not per-scheme
+knobs.
 
 Implementations of the same algorithm should agree bit for bit under the same
 seeded RNG, which is a good check after adding one:
@@ -282,11 +299,12 @@ Rough speeds on this machine: 14 MIPS unhooked (a full ML-DSA-44 signature in
   good proxy for the pqm4 cycle counts (keypair 1,286,649 reported by the
   firmware's own benchmark vs 1,286,622 counted here) but it does not model
   wait states, flash latency or pipeline effects.
-- **Fault-effect, not physical leakage.** The two-key/uniformity detectors
-  measure whether a *fault* makes the output depend on the secret; they are
-  noise-free and idealised — enough to answer *whether* and *where* a fault
-  leaks, not how many real traces or faults an attack needs. (Side-channel
-  leakage-trace simulation lives on the `has-leakage` branch, not here.)
+- **Fault-effect, not physical leakage.** The detectors measure whether a *fault*
+  makes the output depend on the secret; they are noise-free and idealised — enough
+  to answer *whether* and *where* a fault leaks, not how many real traces or faults
+  an attack needs. A per-position `phi` witness **locates a SIFA candidate; it is
+  not a proven exploit.** (Side-channel leakage-trace simulation lives on the
+  `has-leakage` branch, not here.)
 - **No interrupts.** SysTick is modelled as a counter but its interrupt is
   never delivered, so the firmware's own overflow bookkeeping would wrap;
   `stub_cycle_counter()` replaces `hal_get_time` with the exact count instead.
@@ -305,7 +323,7 @@ isolated in one file — `ucpqc/profiles/mldsa.py`** (plus the demo scripts unde
 | `tracing`, `faults`, `replay` | general — operate on instructions/registers/memory/buffers |
 | `assess`, `report`, `cli` | general — the mode engine and reporting, written against the profile interface |
 | `scheme` | crypto-API-general — auto-detects SIGN/KEM entry points and sizes (ML-DSA, ML-KEM, Falcon, SPHINCS+); not one specific scheme |
-| `detectors` | general — `loo_scores`, `two_key_accuracy`, `tvla_t`, `mmd_test`, `uniformity_divergence`, `band_*` take plain feature matrices |
+| `detectors`, `phi` | general — `tvla_t`/`tvla_max`, `bh_fdr`/`holm_bonferroni`, and the per-position phi_IF engine take plain feature matrices / any bound scheme |
 | `detectors.matched_filter` | lattice-FS-specific — negacyclic correlation of a sparse ±1 challenge against response polynomials (the Dilithium *family*, not KEMs/hash-sigs) |
 | **`profiles/mldsa.py`** | **Dilithium-specific — everything below** |
 
@@ -340,12 +358,11 @@ supply is exactly this scheme-specific surface, and everything else is reused.
 must write per scheme         auto / optional (defaulted)      reused unchanged (general)
 ─────────────────────         ───────────────────────────      ──────────────────────────
 patterns  (glob)              fault_sites() (disassembly)      machine, elfimage, platform,
-challenge()                   detector_for() (-> two_key)      tracing, faults, replay,
-response_from_signature()     targets() (probe_target.py,      assess (engine), report, cli,
-response_from_output()          opt-in; else hand-written)     scheme (API detection),
-feature()      + constants    setup(), artifact_len, op        detectors (incl. the field
-field + structural_feature()  field=None (structural off)        backends; except matched_filter),
-  (only for structural)                                        profiles/__init__ (registry)
+challenge()                   secret_coeffs() (phi              tracing, faults, replay,
+response_from_signature()       attribution; else by index)    assess (engine), report, cli,
+response_from_output()        targets() (probe_target.py,      scheme (API detection),
+feature()      + constants      opt-in; else hand-written)     detectors, phi (except
+                              setup(), artifact_len, op          matched_filter), profiles/__init__
 ```
 
 ## Layout
@@ -359,8 +376,9 @@ ucpqc/
   tracing.py    profiler, call tracer, instruction and memory traces
   faults.py     fault models, injector, campaign runner
   replay.py     capture a function's I/O, replay it in isolation under faults
-  detectors.py  two-key classifier, TVLA, MMD, uniformity, band tests
+  detectors.py  per_coord TVLA (matched filter + tvla_max) + BH/Holm corrections
   assess.py     the sweep/funcskip mode engine (scheme-agnostic)
+  phi.py        per-position phi_IF: key-dependent-ineffective (SIFA-candidate) detector
   report.py     console table + bar-chart reporting for assessments
   profiles/     per-scheme analysis knowledge (AnalysisProfile; mldsa.py, mayo.py)
   firmware.py   pqm4 builds and manifest generation

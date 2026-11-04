@@ -34,12 +34,11 @@ def _tag(elf):
 def classify(b, h):
     """status for one function present in both builds, from the two count dicts."""
     dl = h["leak"] - b["leak"]
-    dp = h["phi_sites"] - b["phi_sites"]
-    if dl > 0 or dp > 0:
-        return "introduces", dl, dp
-    if dl < 0 or dp < 0:
-        return "closes", dl, dp
-    return "unchanged", dl, dp
+    if dl > 0:
+        return "introduces", dl
+    if dl < 0:
+        return "closes", dl
+    return "unchanged", dl
 
 
 def diff_markdown(scheme, base_elf, hard_elf, base, hard):
@@ -48,32 +47,28 @@ def diff_markdown(scheme, base_elf, hard_elf, base, hard):
     P(f"# Candidate comparison -- `{scheme}`: baseline vs hardened\n")
     P(f"- **baseline:** `{base_elf}`")
     P(f"- **hardened:** `{hard_elf}`\n")
-    P("Per function, per detector: does the hardened build **close**, **leave**, or **newly "
-      "introduce** fault candidates? (A) = `per_coord`/TVLA leak sites; (B) = phi_IF "
-      "key-dependent-ineffective sites. Matched by symbol; counts, not addresses -- so a "
-      "renamed protected function shows as removed + introduced.\n")
+    P("Per function: does the hardened build **close**, **leave**, or **newly introduce** "
+      "`per_coord`/TVLA leak candidates? Matched by symbol; counts, not addresses -- so a "
+      "renamed protected function shows as removed + introduced.  (The ineffective axis is "
+      "`ucpqc phi`, run separately.)\n")
 
     fns = sorted(set(base) | set(hard))
     tb_leak = sum(base.get(f, {}).get("leak", 0) for f in fns)
     th_leak = sum(hard.get(f, {}).get("leak", 0) for f in fns)
-    tb_phi = sum(base.get(f, {}).get("phi_sites", 0) for f in fns)
-    th_phi = sum(hard.get(f, {}).get("phi_sites", 0) for f in fns)
-    P(f"**Totals:** (A) leak {tb_leak} -> {th_leak} ({th_leak - tb_leak:+d}); "
-      f"(B) phi_IF {tb_phi} -> {th_phi} ({th_phi - tb_phi:+d}).\n")
+    P(f"**Total:** leak {tb_leak} -> {th_leak} ({th_leak - tb_leak:+d}).\n")
 
-    P("| function | (A) base->hard (Δ) | (B) base->hard (Δ) | status |")
-    P("|---|---|---|---|")
+    P("| function | leak base->hard (Δ) | status |")
+    P("|---|---|---|")
     for fn in fns:
         b, h = base.get(fn), hard.get(fn)
         if b is None:
-            P(f"| `{fn}` | — -> {h['leak']} | — -> {h['phi_sites']} ({h['phi_flips']}) | **introduced (new fn)** |")
+            P(f"| `{fn}` | — -> {h['leak']} | **introduced (new fn)** |")
         elif h is None:
-            P(f"| `{fn}` | {b['leak']} -> — | {b['phi_sites']} ({b['phi_flips']}) -> — | removed (fn gone) |")
+            P(f"| `{fn}` | {b['leak']} -> — | removed (fn gone) |")
         else:
-            st, dl, dp = classify(b, h)
+            st, dl = classify(b, h)
             mark = {"introduces": "**introduces**", "closes": "closes", "unchanged": "unchanged"}[st]
-            P(f"| `{fn}` | {b['leak']} -> {h['leak']} ({dl:+d}) | "
-              f"{b['phi_sites']} -> {h['phi_sites']} ({dp:+d}) | {mark} |")
+            P(f"| `{fn}` | {b['leak']} -> {h['leak']} ({dl:+d}) | {mark} |")
     P("")
     intro = [f for f in fns if f in base and f in hard and classify(base[f], hard[f])[0] == "introduces"]
     closed = [f for f in fns if f in base and f in hard and classify(base[f], hard[f])[0] == "closes"]
@@ -122,12 +117,12 @@ def main():
     with open(p_diff, "w") as fh:
         fh.write(diff_markdown(scheme, a.base_elf, a.hardened_elf, base_counts, hard_counts))
 
-    tb = sum(v["leak"] for v in base_counts.values()), sum(v["phi_sites"] for v in base_counts.values())
-    th = sum(v["leak"] for v in hard_counts.values()), sum(v["phi_sites"] for v in hard_counts.values())
+    tb = sum(v["leak"] for v in base_counts.values())
+    th = sum(v["leak"] for v in hard_counts.values())
     print(f"wrote {p_base}\nwrote {p_hard}\nwrote {p_diff}")
-    print(f"  baseline : (A) {tb[0]} leak, (B) {tb[1]} phi_IF")
-    print(f"  hardened : (A) {th[0]} leak, (B) {th[1]} phi_IF")
-    print(f"  Δ        : (A) {th[0]-tb[0]:+d} leak, (B) {th[1]-tb[1]:+d} phi_IF")
+    print(f"  baseline : {tb} leak")
+    print(f"  hardened : {th} leak")
+    print(f"  Δ        : {th-tb:+d} leak")
 
 
 if __name__ == "__main__":

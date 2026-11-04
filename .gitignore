@@ -7,6 +7,16 @@ __pycache__/
 firmware/*.elf
 firmware/*.json
 firmware/*.bin
+firmware_ni/
+
+# LaTeX build artifacts (report/ucpqc_report.*); the .pdf is tracked, these are not
+*.aux
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+report/*.log
+report/*.out
+report/*.toc
 
 # analysis output
 *.npy
@@ -15,5 +25,15 @@ firmware/*.bin
 # fault-analysis dumps (sweep --dump / funcskip --dump); generated data, not source
 /dump/
 /dumps/
+/dumps_ctrl/
+/dumps_mayo/
+/dumps_snap/
 *_instrskip/
 funcskip_sweep/
+# persistent funcskip capture cache (ucpqc capture --out); regenerable, ~20MB
+/captures/
+/captures_m4f/
+/captures_ctrl/
+/dumps_mayo_ni/
+/dumps_ctrl_pa/
+/dumps_ctrl_pa_dumps/

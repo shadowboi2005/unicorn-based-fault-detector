@@ -10,7 +10,7 @@ import struct
 
 import numpy as np
 
-from ..detectors import PrimeField, band_count, matched_filter
+from ..detectors import matched_filter
 from ..replay import Target
 from . import AnalysisProfile, register
 
@@ -29,61 +29,6 @@ POLYZ_BYTES = N_COEFFS * 18 // 8
 SIGLEN = CTILDE_BYTES + POLYZ_BYTES * L + 84
 POLYVECL_BYTES = L * N_COEFFS * 4
 POLY_BYTES = N_COEFFS * 4                     # one polynomial, 256 int32 coefficients
-R0_BOUND = GAMMA2 - BETA                     # gamma2 - beta, the r0 reject bound
-
-
-# -- negacyclic deconvolution over Z_q (for the structural feature) ---------
-# The response z = c*s1 (mod X^256+1, mod Q) once the mask y is skipped.  With c
-# known we recover s1 = z * c^{-1} in the ring Z_q[x]/(x^256+1); when leaking,
-# every signature yields the SAME s1 -> the rows collapse to rank 1, while masked
-# z stays full rank.  The polynomial-ring inverse is done by sympy (a well-tested
-# library) rather than a hand-rolled NTT.  sympy is pure-Python, so this stays
-# free-threading-safe (no GIL re-enable on the 3.14t venv).
-from sympy import GF as _GF, Poly as _Poly, invert as _invert, symbols as _symbols  # noqa: E402
-from sympy.polys.polyerrors import NotInvertible as _NotInvertible                  # noqa: E402
-
-_X = _symbols("x")
-_RING = {}                                   # lazy: {dom, g = x^N + 1}
-_CINV = {}                                   # cache: c.bytes -> c^{-1} Poly (or None)
-
-
-def _ring():
-    if not _RING:
-        dom = _GF(Q, symmetric=False)        # Z_q with representatives in [0, Q)
-        _RING["dom"] = dom
-        _RING["g"] = _Poly(_X ** N_COEFFS + 1, _X, domain=dom)
-    return _RING["dom"], _RING["g"]
-
-
-def _c_inverse(c):
-    """c^{-1} in Z_q[x]/(x^N+1), cached by challenge (same c reused across sites);
-    None if c is not a unit (rare) so that signature contributes no low-rank row."""
-    key = (np.asarray(c, dtype=np.int64) % Q).tobytes()
-    if key not in _CINV:
-        dom, g = _ring()
-        cp = _Poly.from_list(list((np.asarray(c, dtype=object) % Q)[::-1]), _X, domain=dom)
-        try:
-            _CINV[key] = _invert(cp, g)
-        except _NotInvertible:
-            _CINV[key] = None
-    return _CINV[key]
-
-
-def negacyclic_deconv(c, z):
-    """Recover per-poly ``s1`` estimates from ``z`` given challenge ``c`` over Z_q,
-    via the sympy ring inverse ``s1 = z * c^{-1}`` in ``Z_q[x]/(x^N+1)``.  ``c`` is
-    length-N, ``z`` is ``(L, N)``; returns ``(L, N)`` ints in ``[0, Q)``."""
-    dom, g = _ring()
-    cinv = _c_inverse(c)
-    z = np.atleast_2d(np.asarray(z, dtype=object) % Q)
-    out = np.zeros((z.shape[0], N_COEFFS), dtype=np.int64)
-    if cinv is None:
-        return out
-    for r in range(z.shape[0]):
-        s1p = (_Poly.from_list(list(z[r][::-1]), _X, domain=dom) * cinv) % g
-        for k, co in enumerate(s1p.all_coeffs()[::-1]):
-            out[r, k] = int(co) % Q
-    return out
 
 
 def _unpack_gamma1_group(b):
@@ -95,28 +40,10 @@ def _unpack_gamma1_group(b):
             GAMMA1 - ((b[6] >> 6) | b[7] << 2 | b[8] << 10)]
 
 
-class _R0Capture:
-    """Handle for the r0 rejection observer (`r0_observer` / `force_r0_accept`):
-    `.take()` returns the out-of-spec coefficient count (coeffs >= gamma2-beta) of the
-    last signing's ACCEPTED r0 -- 0 when in spec -- and resets for the next signing;
-    `.detach()` removes the hook."""
-
-    def __init__(self, machine, handle, state):
-        self._machine, self._handle, self._state = machine, handle, state
-
-    def take(self):
-        last, self._state["last"] = self._state["last"], 0
-        return last
-
-    def detach(self):
-        self._machine.unhook(self._handle)
-
-
 class MLDSAProfile(AnalysisProfile):
     patterns = ("ml-dsa-*", "dilithium*")
     op = "sign"
     artifact_len = SIGLEN
-    field = PrimeField(Q)                    # Dilithium coefficients live in Z_q
 
     def __init__(self):
         self._cbuf = None                    # persistent scratch for poly_challenge
@@ -160,22 +87,18 @@ class MLDSAProfile(AnalysisProfile):
     def feature(self, context, response):
         return matched_filter(context, response)
 
-    def structural_feature(self, context, response):
-        """Row of Z_q elements for the structural detector: the per-signature
-        `s1` estimate recovered by deconvolving the challenge `c` (`context`) from
-        the response `z`.  When the mask is off (`z = c*s1`) every signature
-        yields the same `s1`, so the rows collapse to a rank-1, key-dependent
-        subspace; when masked, `z` is randomised and the rows stay full rank."""
-        return negacyclic_deconv(context, response).ravel().astype(int)
+    def secret_coeffs(self, sk):
+        """s1 (L x 256) for per-position phi_IF attribution -- see :func:`unpack_s1`."""
+        return unpack_s1(sk)
 
-    # -- targets / detector role -------------------------------------------
-    #: the r0 reject bound, used by the spec-aware detector
-    reject_bound = R0_BOUND
-
+    # -- funcskip targets ---------------------------------------------------
     def targets(self):
-        """Named funcskip targets (short name -> replay.Target)."""
+        """Named funcskip targets (short name -> replay.Target).  The curated few below
+        keep their descriptive labels; the full Dilithium-function table for the
+        LLVM-IR -> ARM translation study is merged in from `dilithium_targets`."""
+        from . import dilithium_targets
         pv = (("out", POLYVECL_BYTES), ("in", POLYVECL_BYTES), ("in", POLYVECL_BYTES))
-        return {
+        curated = {
             "polyvecl_add": Target(func="pqcrystals_dilithium_polyvecl_add",
                                    nth=-1, args=pv, out=0, label="polyvecl_add (z=z+y)"),
             "polyvecl_reduce": Target(func="pqcrystals_dilithium_polyvecl_reduce",
@@ -185,7 +108,6 @@ class MLDSAProfile(AnalysisProfile):
                                 nth=-1, args=(("out", POLYVECL_BYTES), ("in", 64),
                                               "scalar"), out=0,
                                 label="polyvecl_uniform_gamma1 (y)"),
-            # --- paper-leaky targets for per-function instruction-skip dumps ---
             "poly_challenge": Target(func="pqcrystals_dilithium_poly_challenge", nth=-1,
                                      args=(("out", POLY_BYTES), ("in", CTILDE_BYTES)), out=0,
                                      label="poly_challenge (SampleInBall -> c)"),
@@ -196,18 +118,11 @@ class MLDSAProfile(AnalysisProfile):
                                    args=(("in", POLY_BYTES), "scalar"), out="ret",
                                    label="poly_chknorm (rejection check)"),
         }
+        return {**dilithium_targets.TARGETS, **dilithium_targets.M4F_TARGETS, **curated}
 
     def default_target(self):
         """The z = z + y mask add -- the intra-function funcskip target."""
         return self.targets()["polyvecl_add"]
-
-    def detector_for(self, target):
-        name = getattr(target, "name", str(target))
-        if "uniform_gamma1" in name:          # the y nonce sampler
-            return "uniformity"
-        if "chknorm" in name or "r0" in name:
-            return "spec_aware"
-        return "two_key"
 
     def sibling_key(self, sk):
         """Key B = key A with one byte of the packed s1 flipped (offset 128, where
@@ -215,44 +130,6 @@ class MLDSAProfile(AnalysisProfile):
         b = bytearray(sk)
         b[128] ^= 0x01                        # first byte of the packed s1 (ML-DSA-44)
         return bytes(b)
-
-    # -- r0 rejection / Finding-a-Polytope observable (#4) ------------------
-    def r0_observer(self, machine):
-        """Capture the r0 polyveck checked by each r0 rejection test (the
-        `polyveck_chknorm` call with bound R0_BOUND = gamma2-beta), keeping the
-        accepting iteration's (the last).  Feeds the `r0_reject` detector: an accepted
-        r0 out of spec is the Finding-a-Polytope (PKC 2025) leak."""
-        return self._hook_r0(machine, force=False)
-
-    def force_r0_accept(self, machine):
-        """Force the r0 rejection test to always accept (and capture the r0 it waves
-        through), so out-of-spec r0 candidates are released -- the Finding-a-Polytope
-        fault (cf. example 08)."""
-        return self._hook_r0(machine, force=True)
-
-    def _hook_r0(self, machine, force):
-        # This firmware's r0 check is poly_chknorm(r0[i], R0_BOUND) per poly (K calls
-        # per iteration, bound = gamma2-beta), not a single polyveck_chknorm.  We
-        # accumulate the out-of-spec coefficient count across one iteration's r0 burst
-        # and keep the last burst's total -- the ACCEPTED candidate's r0.
-        addr = machine.addr_of("pqcrystals_dilithium_poly_chknorm")
-        state = {"cur": 0, "last": 0, "in_r0": False}
-
-        def on_chknorm(m, a, s):
-            if m.reg("r1") != R0_BOUND:       # z-norm / ct0 checks end the r0 burst
-                state["in_r0"] = False
-                return
-            if not state["in_r0"]:            # start of a fresh r0 burst (new iteration)
-                state["cur"], state["in_r0"] = 0, True
-            poly = np.frombuffer(m.read(m.reg("r0"), N_COEFFS * 4), dtype="<i4")
-            state["cur"] += band_count(poly, R0_BOUND)
-            state["last"] = state["cur"]
-            if force:                         # wave this r0 poly through (bypass reject)
-                m.set_reg("r0", 0)
-                m.set_pc(m.reg("lr"))
-
-        handle = machine.hook_code(on_chknorm, begin=addr, end=addr, precise=False)
-        return _R0Capture(machine, handle, state)
 
 
 def unpack_s1(sk):

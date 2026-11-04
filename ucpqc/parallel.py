@@ -136,8 +136,8 @@ def _enumerate_sites(cfg):
 
 def _run_control(cfg):
     """Run the control (unfaulted) row on the calling thread -> (control_row, golden);
-    golden is shared with the worker threads (in memory) as the ineffective /
-    differential / sifa baseline."""
+    golden is shared with the worker threads (in memory) as the ineffective-fraction
+    baseline."""
     m, scheme, profile = _build_bound_machine(cfg.elf_path, cfg.platform_name,
                                               cfg.seed, cfg.profile_override)
     sk = _assess._make_keys(scheme, cfg.keys, cfg.key_mode, profile)

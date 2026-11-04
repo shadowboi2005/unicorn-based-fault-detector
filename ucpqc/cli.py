@@ -314,6 +314,42 @@ def cmd_detect(args):
     return _emit(args, result)
 
 
+def cmd_phi(args):
+    """Per-position phi_IF: the key-dependent-ineffective (SIFA-candidate) detector."""
+    from . import phi as phimod
+    m, scheme = _machine(args)
+    profile = _profile(args, scheme)
+    result = phimod.per_position_phi(scheme, profile, sites=args.sites, k=args.k,
+                                     budget=args.budget, q=args.fdr)
+    print(f"{result.scheme}  per-position phi_IF  K={result.k}  FDR q={result.q:g}")
+    head = f"  {'addr':>8}  {'callee (bl)':<44} {'witnesses':>9} {'/split':>7}  attribution"
+    print(head)
+    print("  " + "-" * (len(head) - 2))
+    for s in result.sites:
+        addr = f"{s.pc:#06x}"
+        print(f"  {addr:>8}  {s.label[:44]:<44} {len(s.witnesses):>9} {s.n_split:>7}  "
+              f"{s.attribution}")
+    flagged = result.witnesses()
+    print(f"  -> {len(flagged)} site(s) with key-dependent-ineffective witness positions "
+          f"(candidate SIFA surface; not a proven exploit)")
+    return 0
+
+
+def cmd_capture(args):
+    """Build a persistent funcskip capture cache: one 2N-signing pass that records every
+    target's I/O, saved under --out.  Later `funcskip --captures DIR` replays from it
+    with no re-signing (across targets, reruns and sessions)."""
+    from . import captures as capmod
+    names = [args.target] if args.target else None
+    out, manifest = capmod.capture_all(
+        args.elf, args.out, targets=names, platform=args.platform, n=args.n,
+        jobs=args.jobs, key_mode=args.key_mode, profile_override=getattr(args, "profile", None))
+    ntgt = len(manifest["targets"])
+    print(f"captured {ntgt} target(s) x {manifest['n']} signings/key to {out}/  "
+          f"(replay any with:  ucpqc funcskip {args.elf} --target <fn> --captures {out})")
+    return 0
+
+
 def cmd_funcskip(args):
     """Instruction-skip sweep inside one function, via capture-and-replay."""
     dump_dir = getattr(args, "dump", None)
@@ -322,6 +358,21 @@ def cmd_funcskip(args):
         dump_dir = os.path.join(args.dumpdir, autoname)
     elif dump_dir == "__auto__":                  # `--dump` with no value -> <target>_instrskip
         dump_dir = autoname
+    if getattr(args, "captures", None):           # replay from a saved capture cache (no re-sign)
+        from . import captures as capmod, parallel_funcskip as pf
+        meta, caps = capmod.load_captures(args.captures, args.target)
+        result = pf.sweep_function_dump_parallel(
+            args.elf, args.target, platform_name=args.platform, n=meta["n"], jobs=args.jobs,
+            key_mode=meta.get("key_mode", "independent"),
+            profile_override=getattr(args, "profile", None), detector=args.detector,
+            calibrate=not args.legacy_thresholds, n_perm=args.n_perm, fdr_q=args.fdr,
+            correction=args.correction, dump_dir=dump_dir, caps_by_key=caps,
+            replay_budget=args.replay_budget)
+        rc = _emit(args, result)
+        if dump_dir:
+            print(f"\ndumped {len(result.rows)} skip sites to {dump_dir}/ (from cache "
+                  f"{args.captures}; replay offline with:  ucpqc detect {dump_dir})")
+        return rc
     if getattr(args, "jobs", 1) != 1:             # multithreaded path (free-threaded 3.14t)
         from . import parallel_funcskip as pf
         result = pf.sweep_function_dump_parallel(
@@ -517,9 +568,9 @@ def _add_sweep_parser(sub):
                        "(ALAFA-style two-key leak test)")
     _add_common_elf_args(p)
     p.add_argument("--n", type=int, default=24, help="signatures per key")
-    p.add_argument("--detector", default="per_coord",
-                   choices=("two_key", "per_coord", "subspace", "structural", "mmd",
-                            "differential", "sifa", "uniformity", "spec_aware", "r0_reject"))
+    p.add_argument("--detector", default="per_coord", choices=("per_coord",),
+                   help="leak detector (only per_coord under the instruction-skip scope; "
+                        "see report/detector_inventory.md)")
     p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
     p.add_argument("--plot", help="directory to write the result bar chart into")
     p.add_argument("--dump", nargs="?", const="dump", default=None, metavar="DIR",
@@ -551,10 +602,8 @@ def _add_funcskip_parser(sub):
     _add_common_elf_args(p)
     p.add_argument("--target", help="named funcskip target (default: the profile's)")
     p.add_argument("--n", type=int, default=24, help="signatures per key")
-    p.add_argument("--detector", default=None,
-                   choices=("two_key", "per_coord", "subspace", "structural",
-                            "mmd", "uniformity", "spec_aware"),
-                   help="override the profile's detector for the target")
+    p.add_argument("--detector", default=None, choices=("per_coord",),
+                   help="leak detector (only per_coord under the instruction-skip scope)")
     p.add_argument("--backend", default="call", choices=("call", "snapshot"))
     p.add_argument("--replay-budget", type=int, default=5_000_000, dest="replay_budget",
                    metavar="INSNS",
@@ -575,8 +624,46 @@ def _add_funcskip_parser(sub):
     p.add_argument("--dumpdir", metavar="BASE",
                    help="dump into BASE/<target>_instrskip/ (a clean base-dir form of "
                         "--dump; implies dumping -- good for sweeping many targets into one dir)")
+    p.add_argument("--captures", metavar="DIR",
+                   help="replay from a saved capture cache (built by `ucpqc capture`) instead "
+                        "of re-signing -- fast, reusable across targets/reruns/sessions")
     _add_calibration_flags(p)
     p.set_defaults(handler=cmd_funcskip)
+
+
+def _add_phi_parser(sub):
+    p = sub.add_parser("phi", help="per-position phi_IF: the key-dependent-ineffective "
+                       "(SIFA-candidate) detector -- skip each signing-body callee and test, "
+                       "per output byte, whether ineffectiveness is secret-dependent")
+    _add_common_elf_args(p)
+    p.add_argument("--k", type=int, default=32,
+                   help="keys (secret arm) / messages (input control) to sample (default 32)")
+    p.add_argument("--sites", default=None,
+                   help="comma-separated substrings restricting the signing-body callees "
+                        "to score (default: every direct callee)")
+    p.add_argument("--budget", type=int, default=40_000_000,
+                   help="max instructions per skip-replay (default 4e7)")
+    p.add_argument("--fdr", type=float, default=0.05,
+                   help="BH-FDR level across output positions (default 0.05; raise toward "
+                        "recall)")
+    p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
+    p.set_defaults(handler=cmd_phi)
+
+
+def _add_capture_parser(sub):
+    p = sub.add_parser("capture", help="build a persistent funcskip capture cache "
+                       "(one 2N-signing pass over all targets) for reuse with "
+                       "`funcskip --captures`")
+    _add_common_elf_args(p)
+    p.add_argument("--out", default="captures", metavar="DIR",
+                   help="directory to write the capture cache into (default captures/)")
+    p.add_argument("--target", help="capture only this target (default: every profile target)")
+    p.add_argument("--n", type=int, default=40, help="signatures per key to capture")
+    p.add_argument("-j", "--jobs", type=int, default=0,
+                   help="worker threads (0=all cores; free-threaded 3.14t for real parallelism)")
+    p.add_argument("--key-mode", default="independent", choices=("independent", "sibling"))
+    p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
+    p.set_defaults(handler=cmd_capture)
 
 
 def build_parser():
@@ -599,6 +686,8 @@ def build_parser():
     _add_sweep_parser(sub)
     _add_detect_parser(sub)
     _add_funcskip_parser(sub)
+    _add_phi_parser(sub)
+    _add_capture_parser(sub)
     return parser
 
 

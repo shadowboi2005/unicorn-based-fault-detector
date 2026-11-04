@@ -58,7 +58,9 @@ def _capture_item(ctx_args, target, key, i, msg, budget):
     w = _worker(*ctx_args)
     m, scheme, profile = w["m"], w["scheme"], w["profile"]
     m.restore(w["clean"])
-    w["stream"].reset(f"nonce-{key}-{i}".encode())
+    # shared per-message seed (same for A and B) so only the secret key differs between the
+    # two populations -- isolates key-dependence for the leak and key-dependent-ineffective tests
+    w["stream"].reset(f"nonce-{i}".encode())
     rec = Recorder(m, target, snapshot=False)           # "call" backend: pure-data caps
     rec.arm()
     try:
@@ -96,12 +98,15 @@ def sweep_function_dump_parallel(elf_path, target_name, platform_name="mps2-an38
                                  detector=None, budget=5_000_000, calibrate=True,
                                  n_perm=assess.DEFAULT_N_PERM, fdr_q=assess.FDR_Q,
                                  correction="bh", dump_dir=None, progress=None,
-                                 replay_budget=None):
+                                 caps_by_key=None, replay_budget=None):
     """Run a funcskip sweep over `target_name` with `jobs` threads and (optionally)
     write a dump to `dump_dir`.  Capture is parallelised over the 2N signings, replay
     over the skip sites, so a capture-bound (few-site) and a replay-bound (many-site)
     target both scale.  Returns an `AssessmentResult` (mode ``funcskip``).  Intended
     for the free-threaded interpreter; on a GIL build it is correct but serial.
+
+    `caps_by_key` ({key: [Capture]}): if given, SKIP the capture phase and replay these
+    pre-loaded captures (the `--captures` cache path) -- no re-signing.
 
     `budget` caps the capture signings; `replay_budget` (default = `budget`) caps each
     skip-replay -- lowering it kills loop-breaking runaway replays sooner (they are
@@ -116,22 +121,23 @@ def sweep_function_dump_parallel(elf_path, target_name, platform_name="mps2-an38
     scheme, profile, m = c["scheme"], c["profile"], c["m"]
     targets = profile.targets() if hasattr(profile, "targets") else {}
     target = targets.get(target_name) or profile.default_target()
-    detector = detector or profile.detector_for(target)
+    detector = detector or "per_coord"
     messages = assess.standard_messages(n)
     specs = list(_skip_sites(m, target, 1, True))
     featurize = assess._make_featurize(profile, detector)
     detect = assess._make_detect(profile, detector, calibrate, n_perm)
 
-    # ---- phase 1: parallel capture (2N signings) ----
-    raw = {"A": {}, "B": {}}
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
-        futs = [pool.submit(_capture_item, ctx_args, target, k, i, messages[i], budget)
-                for k in ("A", "B") for i in range(n)]
-        for f in futs:
-            key, i, cap = f.result()
-            if cap is not None:
-                raw[key][i] = cap
-    caps_by_key = {k: [raw[k][i] for i in sorted(raw[k])] for k in ("A", "B")}
+    # ---- phase 1: parallel capture (2N signings) -- skipped if captures were supplied
+    if caps_by_key is None:
+        raw = {"A": {}, "B": {}}
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            futs = [pool.submit(_capture_item, ctx_args, target, k, i, messages[i], budget)
+                    for k in ("A", "B") for i in range(n)]
+            for f in futs:
+                key, i, cap = f.result()
+                if cap is not None:
+                    raw[key][i] = cap
+        caps_by_key = {k: [raw[k][i] for i in sorted(raw[k])] for k in ("A", "B")}
 
     # ---- phase 2: parallel replay (skip sites) ----
     rows, site_recs = [], []

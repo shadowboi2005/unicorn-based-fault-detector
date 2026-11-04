@@ -52,6 +52,11 @@ class Target:
                output buffer.  Empty => output is the return value.
     `out`   -- "ret" (return value) or an argument index whose buffer is the
                output.
+    `caller`-- optional function symbol: only invocations whose return address
+               lies inside it are counted (and `nth` indexes among those).  Picks
+               the operand role of a function called from several places, e.g.
+               `ntt` from `polyvecl_ntt` (NTT(y)) vs from the signing body
+               (NTT(c)).  Tail-call thunks keep LR in the real caller.
     """
     func: object = None
     region: tuple = None
@@ -59,6 +64,7 @@ class Target:
     args: tuple = ()
     out: object = "ret"
     label: str = ""
+    caller: str = None
 
     def out_size(self):
         return 0 if self.out == "ret" else int(self.args[self.out][1])
@@ -81,6 +87,35 @@ class Capture:
     scalars: dict = field(default_factory=dict)  # {arg_index: value} for scalars
     snap: object = None            # Machine.Snapshot (backend A)
     golden_output: object = None   # bytes (buffer) or int (return value)
+
+
+def cap_to_dict(cap):
+    """Serialize a `call`-backend Capture (pure data) to a JSON-able dict, for a
+    persistent capture cache (`ucpqc.captures`).  `snap` (the snapshot-backend state)
+    is not serialized -- caches are built with the call backend.  Includes the
+    `golden_output` and the challenge `c` the assess layer attaches."""
+    g = cap.golden_output
+    return {
+        "key": cap.key, "entry": cap.entry, "ret": cap.ret,
+        "regs": dict(cap.regs), "out_ptr": cap.out_ptr,
+        "inputs": {str(i): b.hex() for i, b in cap.inputs.items()},
+        "scalars": {str(i): int(v) for i, v in cap.scalars.items()},
+        "golden": g.hex() if isinstance(g, (bytes, bytearray)) else g,
+        "c": [int(x) for x in getattr(cap, "c", [])],
+    }
+
+
+def cap_from_dict(d):
+    """Inverse of :func:`cap_to_dict`: rebuild a Capture ready for the call backend."""
+    import numpy as np
+    cap = Capture(key=d["key"], entry=d["entry"], ret=d["ret"],
+                  regs={k: int(v) for k, v in d["regs"].items()}, out_ptr=d["out_ptr"])
+    cap.inputs = {int(i): bytes.fromhex(h) for i, h in d["inputs"].items()}
+    cap.scalars = {int(i): int(v) for i, v in d["scalars"].items()}
+    g = d["golden"]
+    cap.golden_output = bytes.fromhex(g) if isinstance(g, str) else g
+    cap.c = np.array(d.get("c", []), float)
+    return cap
 
 
 # --------------------------------------------------------------------------
@@ -108,6 +143,8 @@ class Recorder:
         self._count = 0
         self._pending = None
         self._result = None
+        self._caller = (machine.image.extent_of(target.caller)
+                        if target.caller is not None else None)
         if target.func is not None:
             self.entry = machine.addr_of(target.func)
             self._trig = Trigger(machine, target.func, nth=0,
@@ -152,6 +189,10 @@ class Recorder:
             cap.golden_output = mm.read(cap.out_ptr, self.target.out_size())
 
     def _on_arm(self, mm):
+        if self._caller is not None:                 # count only calls from `caller`
+            lo, hi = self._caller
+            if not lo <= self._trig.ret < hi:
+                return
         self._count += 1
         if self._is_target(self._count):
             self._pending = self._grab_entry(mm, self._trig.ret)
@@ -345,7 +386,7 @@ def skip_sweep(machine, target, captures_by_key, featurize, detect,
 
     `captures_by_key` is {key: [Capture, ...]}.
     `featurize(capture, output) -> feature`   (e.g. matched_filter(cap.c, unpack(out)))
-    `detect(features_by_key) -> dict`         (e.g. {'acc': two_key_accuracy(...)})
+    `detect(features_by_key) -> dict`         (e.g. {'metric': tvla_max(...)[0]})
     Returns per-site dicts: {'pc', 'text', 'crashed', 'ran', **detect_result}.
     """
     results = []

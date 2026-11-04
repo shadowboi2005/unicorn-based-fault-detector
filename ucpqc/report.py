@@ -15,9 +15,7 @@ _STATUS = {
 def _fmt_metric(result, metric):
     if metric is None:
         return "  -- "
-    if result.detector in ("two_key", "uniformity"):     # accuracy / bin-share, as a percent
-        return f"{metric:4.0%}"
-    return f"{metric:.3g}"
+    return f"{metric:.3g}"                                # per_coord metric is max |t|
 
 
 def _fmt_p(p):
@@ -88,12 +86,7 @@ def plot_sweep(result, path):
     fig, ax = plt.subplots(figsize=(9, max(3, 0.42 * len(rows) + 1)))
     y = np.arange(len(names))[::-1]
     ax.barh(y, vals, color=colors, edgecolor="white")
-    if result.detector in ("two_key", "uniformity"):
-        if not getattr(result, "calibrate", True):     # legacy: show the fixed cutoff
-            ax.axvline(80, color="#c44e52", ls="--", lw=1, label="leak threshold (80%)")
-        ax.axvline(50, color="#888888", ls=":", lw=1, label="chance (50%)")
-        ax.set_xlim(0, 100)
-        ax.set_xlabel(f"{result.detector} metric (%)")
+    ax.set_xlabel(f"{result.detector} metric")
     for yi, r, v in zip(y, rows, vals):
         txt = "crash/hang" if r.status == "crash" else _fmt_metric(result, r.metric).strip()
         ax.text(1.5, yi, txt, va="center", ha="left", fontsize=7.5,
