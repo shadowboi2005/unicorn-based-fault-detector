@@ -18,7 +18,7 @@ Typical capture-once / replay-many workflow:
 scripts/capture.sh                                   # one signing pass -> captures/ (all targets)
 scripts/run_funcskip.sh firmware/ml-dsa-44_m4f_test.elf 40 14 \
     --target poly_add --captures captures --dumpdir dumps   # replay, no re-sign
-scripts/detect.sh dumps/poly_add_instrskip --detector structural
+scripts/detect.sh dumps/poly_add_instrskip --detector per_coord
 ```
 
 The run scripts pick the interpreter automatically: the free-threaded `.venv314t`

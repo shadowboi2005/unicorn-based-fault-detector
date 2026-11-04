@@ -36,10 +36,31 @@ os.chdir(ROOT)
 import numpy as np  # noqa: E402
 from scipy.stats import fisher_exact  # noqa: E402
 
-from ucpqc import Machine, Scheme, assess, candidates, detectors, profiles as pm  # noqa: E402
+from ucpqc import Machine, Scheme, assess, detectors, profiles as pm  # noqa: E402
 from ucpqc.profiles import signing_body, _scan_calls  # noqa: E402
 from ucpqc.faults import FaultSpec, SKIP  # noqa: E402
 from ucpqc.replay import Injector  # noqa: E402
+
+
+def _phi_counts(caps, sites):
+    """Whole-output phi_IF flip counter (self-contained; the engine's old
+    candidates._phi_counts was retired with the whole-output detector).  Returns
+    `(phi_sites, phi_flips, [(pc, text, flips)])`: a site flips on a message when the
+    skip changed the released signature for one key but not the other."""
+    gold = {k: [r.get("golden") for r in caps.get(k, [])] for k in "AB"}
+    phi_sites = phi_flips = 0
+    detail = []
+    for sd in sites:
+        effA = {r["idx"]: (r["out"] != gold["A"][r["idx"]]) for r in sd["A"]
+                if r["idx"] < len(gold["A"]) and gold["A"][r["idx"]] is not None}
+        effB = {r["idx"]: (r["out"] != gold["B"][r["idx"]]) for r in sd["B"]
+                if r["idx"] < len(gold["B"]) and gold["B"][r["idx"]] is not None}
+        flips = sum(1 for i in (set(effA) & set(effB)) if effA[i] != effB[i])
+        phi_flips += flips
+        if flips:
+            phi_sites += 1
+        detail.append((sd["pc"], sd.get("text", ""), flips))
+    return phi_sites, phi_flips, detail
 
 ELF = "firmware/ml-dsa-44_clean_test.elf"
 SIG_BYTES = 2420            # ML-DSA-44 CRYPTO_BYTES
@@ -135,7 +156,7 @@ def main():
     caps_box = {sd: [capture_entry(k, j) for k, j in items] for sd, items in sides.items()}
     golden = {sd: [run(b) for b in caps_box[sd]] for sd in sides}
 
-    # Build the funcskip-dump-shaped structures so we can reuse candidates._phi_counts.
+    # Build the funcskip-dump-shaped structures for the local _phi_counts flip counter.
     caps = {"A": [{"golden": golden["A"][i]} for i in range(n)],
             "B": [{"golden": golden["B"][i]} for i in range(n)]}
     capsC = {"A": [{"golden": golden["A"][i]} for i in range(n)],
@@ -150,8 +171,8 @@ def main():
         rows_aa.append({"pc": f"{pc:#06x}", "text": lbl, "A": recsA, "B": recsC})
         print(f"  [{si+1}/{len(sites)}] {lbl}", file=sys.stderr)
 
-    _, flips_ab, detail_ab = candidates._phi_counts(caps, rows_ab)
-    _, flips_aa, detail_aa = candidates._phi_counts(capsC, rows_aa)
+    _, flips_ab, detail_ab = _phi_counts(caps, rows_ab)
+    _, flips_aa, detail_aa = _phi_counts(capsC, rows_aa)
     fab = {d[0]: d[2] for d in detail_ab}        # pc-str -> A/B flips
     faa = {d[0]: d[2] for d in detail_aa}        # pc-str -> A/A' flips
 

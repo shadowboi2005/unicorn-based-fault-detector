@@ -1,41 +1,34 @@
-"""Distribution detectors for leakage / fault assessment.
+"""Statistical primitives for the two retained detectors.
 
-These were developed and validated in examples 07-09 (two-key matched-filter
-classifier, TVLA t-test, permutation p-value) and example 08 (spec-aware
-band-localized r0 tests, MMD), where they lived as copy-pasted script-local
-functions.  They are collected here so the ALAFA sweep (example 09) and the
-intra-function skip tool (example 10) share one implementation.
+Scope note: the platform's fault model is single-signature **instruction skip**, so
+it keeps exactly two detectors (see `report/detector_inventory.md`):
 
-Every detector consumes per-item feature vectors, shape ``(N, D)`` (or ``(N,)``
-for scalar features), with the two populations passed as separate arrays.  The
-right detector depends on the faulted quantity's *role*:
+  * **per_coord** -- per-coordinate TVLA (:func:`tvla_max`): does ANY single output
+    coordinate separate the two keys?  The one detector with a confirmed hit
+    (`polyvecl_add`).  Maps to the LLVM study's `correction` oracle.
+  * **per-position phi_IF** -- key-dependent ineffectiveness, per output position
+    (`ucpqc.phi`).  Maps to the LLVM study's `ineffective` oracle.  Uses
+    :func:`bh_fdr` here and scipy's Fisher exact test.
 
-  * output is secret-dependent (c*s1, z, r0)  -> two_key_accuracy / tvla_t
-  * output must be uniform (the nonce y)      -> uniformity_divergence
-  * inline rejection decision (out-of-spec r0)-> band_levene / band_count
+Both sweep over many sites, so both compose their per-site/per-position p-values with
+a multiple-testing correction (:func:`bh_fdr` / :func:`holm_bonferroni`).
+
+The richer detectors (two_key/subspace/structural/mmd/uniformity/spec_aware/
+differential/sifa and their primitives) targeted fault models this platform does not
+run; they were removed on branch `refactor/trim-detectors-instr-skip` and can be
+restored from git history if a data-fault / MAYO / multi-signature regime is added
+back.  `report/detector_inventory.md` records the rationale per detector.
 """
 
 import numpy as np
 
-__all__ = [
-    "matched_filter", "loo_scores", "two_key_accuracy", "tvla_t", "tvla_max",
-    "lda_accuracy", "Field", "PrimeField", "GF2m", "structural_leak",
-    "perm_pvalue", "mmd_test", "bh_fdr", "holm_bonferroni",
-    "uniformity_divergence", "band_count", "band_levene",
-]
+__all__ = ["matched_filter", "tvla_t", "tvla_max", "bh_fdr", "holm_bonferroni"]
 
-# -- detector tuning knobs (named in one place; none are scheme-specific) ---
-# Verdict thresholds (accuracy/score cutoffs that decide leak/ok) live with the
-# engine in ucpqc.assess; these are detector-internal defaults.
 TVLA_T = 4.5           # classic per-coordinate TVLA |t| flag (informational count)
-LDA_SHRINK = 0.1       # default within-key covariance shrinkage (lda_accuracy)
-UNIFORM_BINS = 64      # default histogram bins (uniformity_divergence)
-PERM_SEED = 0          # default RNG seed for the permutation-based detectors
-DEFAULT_N_PERM = 1000  # default key-label shuffles for perm_pvalue / mmd_test
 
 
 # --------------------------------------------------------------------------
-# feature extraction
+# feature extraction (per_coord's challenge-aware feature)
 # --------------------------------------------------------------------------
 def matched_filter(c, z):
     """c-aware feature: negacyclic correlation of the sparse challenge ``c``
@@ -62,31 +55,8 @@ def matched_filter(c, z):
 
 
 # --------------------------------------------------------------------------
-# two-key (secret-dependence) tests -- example 07/09
+# per_coord -- per-coordinate TVLA leak localization
 # --------------------------------------------------------------------------
-def loo_scores(F0, F1):
-    """Leave-one-out signed discriminant score per item.
-
-    ``score(x) = <x, g_own_LOO> - <x, g_other>`` against per-key mean templates,
-    leaving x out of its own template so it never helps classify itself.  Key-0
-    items should score > 0, key-1 items < 0.  Returns ``(s0, s1)``.
-    """
-    F0, F1 = np.asarray(F0, float), np.asarray(F1, float)
-    g1, g0 = F1.mean(0), F0.mean(0)
-    s0 = np.array([F0[i] @ ((F0.sum(0) - F0[i]) / (len(F0) - 1)) - F0[i] @ g1
-                   for i in range(len(F0))])
-    s1 = np.array([F1[i] @ g0 - F1[i] @ ((F1.sum(0) - F1[i]) / (len(F1) - 1))
-                   for i in range(len(F1))])
-    return s0, s1
-
-
-def two_key_accuracy(F0, F1):
-    """Fraction of items classified to the correct key (0.5 = indistinguishable,
-    1.0 = fully separable).  This is the ALAFA leak metric of example 09."""
-    s0, s1 = loo_scores(F0, F1)
-    return (np.mean(s0 > 0) + np.mean(s1 < 0)) / 2
-
-
 def tvla_t(F0, F1):
     """Per-coordinate Welch t between the two populations (length-D vector).
     TVLA flags a leak if any |t| > 4.5 (~ two-sided p < 1e-5)."""
@@ -100,15 +70,13 @@ def tvla_t(F0, F1):
 
 
 def tvla_max(F0, F1):
-    """Detector A -- per-coordinate leak localization.
+    """Detector `per_coord` -- per-coordinate leak localization.
 
     Reduces the per-coordinate TVLA (:func:`tvla_t`) to one statistic: the
     maximum ``|t|`` over all D coordinates, plus how many coordinates clear the
-    classic 4.5 threshold.  Where ``two_key_accuracy`` builds one whole-vector
-    mean template (and so *dilutes* a leak that lives in a few coordinates across
-    all D dims), this asks "does ANY single output position separate the keys?"
-    -- catching a secret coefficient exposed at a fixed byte.  The caller applies
-    a multiple-comparison-corrected threshold (D coordinates were tested).
+    classic 4.5 threshold.  Asks "does ANY single output position separate the
+    keys?" -- catching a secret coefficient exposed at a fixed byte.  The caller
+    applies a multiple-comparison-corrected threshold (D coordinates were tested).
     Returns ``(max_abs_t, n_over)`` where n_over counts coordinates past the
     classic ``TVLA_T`` flag (informational; the verdict uses the corrected
     threshold)."""
@@ -117,235 +85,9 @@ def tvla_max(F0, F1):
             int(np.sum(at > TVLA_T)))
 
 
-def _top_pca_basis(X, k):
-    """Orthonormal ``D x k`` basis of the top-k principal directions of ``X``
-    (the leading right-singular vectors of the centered data)."""
-    _, _, Vt = np.linalg.svd(X - X.mean(0), full_matrices=False)
-    return Vt[:k].T
-
-
-def _pooled_within_covariance(G0, G1):
-    """Within-key covariance pooled across both keys, each centered on its own
-    mean; shape ``(d, d)``."""
-    C0, C1 = G0 - G0.mean(0), G1 - G1.mean(0)
-    pooled = (C0.T @ C0 + C1.T @ C1) / max(len(G0) + len(G1) - 2, 1)
-    return np.atleast_2d(pooled)
-
-
-def _inverse_sqrt(cov, shrink):
-    """``cov^{-1/2}`` after shrinking ``cov`` toward a scaled identity by ``shrink``
-    (Ledoit-Wolf style), so it stays invertible when D >> N."""
-    d = cov.shape[0]
-    mean_var = np.trace(cov) / d
-    shrunk = (1.0 - shrink) * cov + shrink * mean_var * np.eye(d)
-    vals, vecs = np.linalg.eigh(shrunk)
-    return vecs @ np.diag(np.clip(vals, 1e-12, None) ** -0.5) @ vecs.T
-
-
-def lda_accuracy(F0, F1, shrink=LDA_SHRINK):
-    """Detector B -- covariance-aware (structural) separability.
-
-    The generalization of :func:`two_key_accuracy`: whiten both populations by
-    their pooled within-key covariance (shrunk toward a scaled identity so it
-    inverts when D >> N), then run the same leave-one-out nearest-mean classifier
-    in the whitened space.  Nearest-mean (``two_key``) assumes identity
-    covariance and so only sees a whole-vector *mean shift*; after whitening the
-    same classifier is a regularized linear discriminant that also separates keys
-    differing in a **low-dimensional / correlated subspace** -- the structure the
-    piece-by-piece accumulation attacks (faulted outputs confined to a
-    key-dependent subspace, e.g. MAYO's oil space; Dilithium's ``z = c*s1``)
-    reveal but a mean template misses.  ``two_key`` is the ``shrink=1`` (identity
-    whitening) special case; per-coordinate (:func:`tvla_max`) is the diagonal
-    case.  Returns leave-one-out accuracy in ``[0, 1]`` (0.5 = chance).
-
-    LDA needs an estimable within-key covariance, so when D >> N we first project
-    onto the top ``<= N-2`` principal components of the pooled data; this bounds
-    the covariance rank and stops the whitening from over-fitting spurious
-    high-dimensional directions (which otherwise inflates accuracy on pure noise).
-    Even so, treat B as trustworthy only with N well above the retained component
-    count -- at small N it is optimistic and should be permutation-calibrated."""
-    F0, F1 = np.asarray(F0, float), np.asarray(F1, float)
-    n0, n1 = len(F0), len(F1)
-    if n0 < 2 or n1 < 2:
-        return two_key_accuracy(F0, F1)                    # too few to estimate a covariance
-    X = np.vstack([F0, F1])
-    n_components = max(1, min(X.shape[1], n0 + n1 - 2))     # bound the covariance rank at N-2
-    basis = _top_pca_basis(X, n_components)                # project D >> N into an estimable space
-    G0, G1 = F0 @ basis, F1 @ basis
-    whiten = _inverse_sqrt(_pooled_within_covariance(G0, G1), shrink)
-    return two_key_accuracy(G0 @ whiten, G1 @ whiten)      # nearest-mean, in the whitened space
-
-
 # --------------------------------------------------------------------------
-# field-parameterized structural / recoverability detector -- the algebra-aware
-# generalization of B: a leak shows as the faulted outputs collapsing to a
-# low-dimensional, key-dependent subspace OVER THE SCHEME'S OWN FIELD.  The
-# arithmetic (rank over the field) is a pluggable backend so one detector serves
-# GF(16) (MAYO) and Z_q (Dilithium) alike; the scheme supplies the feature rows.
+# multiple-testing corrections (shared by per_coord sweeps and per-position phi)
 # --------------------------------------------------------------------------
-class Field:
-    """Linear algebra over a scheme's algebra.  Subclasses implement ``rank`` of
-    an integer matrix over the field; that is all ``structural_leak`` needs."""
-    name = "field"
-
-    def rank(self, M):                        # pragma: no cover - interface
-        raise NotImplementedError
-
-
-class PrimeField(Field):
-    """GF(p) for a prime modulus -- Dilithium's coefficient field Z_q."""
-
-    def __init__(self, p):
-        self.p = int(p)
-        self.name = f"GF({p})"
-
-    def rank(self, M):
-        """Row rank over GF(p) by Gaussian elimination mod p (the running pivot
-        count is the rank)."""
-        p = self.p
-        mat = np.atleast_2d(np.asarray(M, dtype=np.int64) % p).copy()
-        rows, cols = mat.shape
-        rank = 0
-        for col in range(cols):
-            nonzero = np.nonzero(mat[rank:, col])[0]
-            if nonzero.size == 0:                           # no pivot in this column
-                continue
-            pivot = rank + int(nonzero[0])
-            mat[[rank, pivot]] = mat[[pivot, rank]]
-            mat[rank] = (mat[rank] * pow(int(mat[rank, col]), p - 2, p)) % p   # scale pivot to 1 (Fermat inverse)
-            below = mat[:, col].copy(); below[rank] = 0     # eliminate this column in every other row
-            mat = (mat - np.outer(below, mat[rank])) % p    # products < p^2 < 2^63 -> int64-safe
-            rank += 1
-            if rank == rows:
-                break
-        return rank
-
-
-class GF2m(Field):
-    """GF(2^m) via log/antilog tables (add = XOR) -- MAYO's field is GF(16)."""
-
-    def __init__(self, m=4, poly=0x13):
-        self.m, self.q = m, 1 << m
-        self.name = f"GF(2^{m})"
-        self._exp = [0] * (2 * self.q); self._log = [0] * self.q
-        x = 1
-        for i in range(self.q - 1):
-            self._exp[i] = x; self._log[x] = i
-            x <<= 1
-            if x & self.q:
-                x ^= poly
-        for i in range(self.q - 1, 2 * self.q):
-            self._exp[i] = self._exp[i - (self.q - 1)]
-
-    def _mul(self, a, b):
-        return 0 if a == 0 or b == 0 else self._exp[self._log[a] + self._log[b]]
-
-    def _inv(self, a):
-        return self._exp[(self.q - 1) - self._log[a]]
-
-    def rank(self, M):
-        """Row rank over GF(2^m) by Gaussian elimination (add = XOR); the running
-        pivot count is the rank."""
-        mat = [[int(v) & (self.q - 1) for v in row] for row in np.asarray(M).tolist()]
-        rows, cols = len(mat), (len(mat[0]) if mat else 0)
-        rank = 0
-        for col in range(cols):
-            pivot = next((i for i in range(rank, rows) if mat[i][col]), None)
-            if pivot is None:                               # no pivot in this column
-                continue
-            mat[rank], mat[pivot] = mat[pivot], mat[rank]
-            inv = self._inv(mat[rank][col])
-            mat[rank] = [self._mul(v, inv) for v in mat[rank]]        # scale pivot to 1
-            for i in range(rows):
-                if i != rank and mat[i][col]:               # eliminate this column elsewhere
-                    factor = mat[i][col]
-                    mat[i] = [a ^ self._mul(factor, b) for a, b in zip(mat[i], mat[rank])]
-            rank += 1
-            if rank == rows:
-                break
-        return rank
-
-
-def structural_leak(F0, F1, field):
-    """Detector B* -- field-aware structural / recoverability test.
-
-    ``F0``/``F1`` are ``(N, D)`` integer matrices of FIELD ELEMENTS (the scheme's
-    structural feature, e.g. MAYO's exposed oil bytes over GF(16), or Dilithium's
-    per-signature ``s1`` estimate over Z_q).  A genuine leak makes each key's rows
-    collapse to a low-dimensional subspace over ``field`` and makes the two keys'
-    subspaces *differ* -- the structure accumulation attacks reveal and solve.
-    Returns the score in ``[0, 1]`` (the engine applies the leak threshold, like
-    the other metric detectors)::
-
-        collapse   = 1 - max(rank F0, rank F1) / full   # each key in few dims
-        separation = (rank[F0;F1] - max) / min(rank)    # subspaces are key-specific
-        score      = collapse * separation
-
-    Golden/masked outputs stay full-rank -> collapse ~ 0 -> no leak."""
-    F0 = np.asarray(F0); F1 = np.asarray(F1)
-    if F0.ndim == 1:
-        F0 = F0[:, None]; F1 = F1[:, None]
-    ambient_rank = min(min(F0.shape[0], F1.shape[0]), F0.shape[1])   # rank a non-leaking key fills
-    rank_A, rank_B = field.rank(F0), field.rank(F1)
-    rank_joint = field.rank(np.vstack([F0, F1]))
-    per_key_rank = max(rank_A, rank_B)                    # both keys must collapse to score
-    collapse = 1.0 - per_key_rank / max(ambient_rank, 1)
-    separation = (rank_joint - per_key_rank) / max(min(rank_A, rank_B), 1)
-    return max(0.0, collapse) * max(0.0, separation)
-
-
-def perm_pvalue(stat_fn, F0, F1, n_perm=DEFAULT_N_PERM, rng=None):
-    """Permutation-calibrated p-value for any two-sample leak statistic, under the
-    null that the two key populations are exchangeable.
-
-    ``stat_fn(A, B) -> float`` is the statistic (larger = more separable) -- e.g.
-    :func:`two_key_accuracy`, :func:`lda_accuracy`, or a
-    ``lambda a, b: structural_leak(a, b, field)`` closure.  We shuffle the key
-    labels ``n_perm`` times to build the null distribution, then return THREE
-    numbers ``(observed, p_emp, p_tail)``:
-
-      * ``p_emp = (1 + #{T_b >= T_obs}) / (n_perm + 1)`` -- the assumption-free
-        empirical p-value, floored at ``1/(n_perm+1)``.
-      * ``p_tail`` -- a Gaussian upper tail on the studentised statistic
-        ``(T_obs - mean)/std`` of the null.  It RESOLVES the case where the observed
-        statistic beats every permutation (``p_emp`` pinned at the floor).  It falls
-        well below ``1/(n_perm+1)`` when the null is CONCENTRATED (e.g. the structural
-        rank score, whose null sits at ~0, so std->0 and the tail is sharp),
-        sharpening an isolated strong site; for a WIDE null (e.g. two_key at small N)
-        it stays near the floor, so a very large sweep should raise ``n_perm`` until
-        the floor clears ``q/sites``.  Used only at the floor (see ``_resolve_p``);
-        ``p_emp`` has resolution everywhere else.
-
-    Callers combine the per-site p-values across a sweep with :func:`bh_fdr` /
-    :func:`holm_bonferroni`.  ``stat_fn`` defaults are the caller's job (this stays
-    generic); the previous ``perm_pvalue(F0, F1)`` two_key-only form is now
-    ``perm_pvalue(two_key_accuracy, F0, F1)``."""
-    from scipy import stats
-    rng = np.random.default_rng(PERM_SEED) if rng is None else rng
-    F0 = np.asarray(F0, float); F1 = np.asarray(F1, float)
-    obs = float(stat_fn(F0, F1))
-    X = np.vstack([F0, F1])
-    n = len(F0)
-    null = np.empty(n_perm)
-    for i in range(n_perm):
-        idx = rng.permutation(len(X))
-        null[i] = stat_fn(X[idx[:n]], X[idx[n:]])
-    p_emp = (1 + int(np.sum(null >= obs))) / (n_perm + 1)
-    sd = float(null.std(ddof=1))
-    z = (obs - float(null.mean())) / sd if sd > 0 else np.inf
-    p_tail = float(stats.norm.sf(z))
-    return obs, p_emp, p_tail
-
-
-def _resolve_p(p_emp, p_tail, n_perm):
-    """Combine the empirical and tail p-values from :func:`perm_pvalue`: trust the
-    assumption-free empirical p where it has resolution, and fall to the Gaussian
-    tail only when the observed statistic beat every permutation (``p_emp`` pinned
-    at the ``1/(n_perm+1)`` floor)."""
-    floor = 1.0 / (n_perm + 1)
-    return p_emp if p_emp > floor else min(p_emp, p_tail)
-
-
 def bh_fdr(pvals, q):
     """Benjamini-Hochberg step-up rejection mask controlling the false-discovery
     rate at level ``q``.  ``pvals`` is a 1-D array; returns a bool array (input
@@ -377,75 +119,3 @@ def holm_bonferroni(pvals, alpha):
     mask = np.zeros(m, dtype=bool)
     mask[order[:stop]] = True
     return mask
-
-
-def mmd_test(A, B, n_perm=1000, rng=None):
-    """Kernel two-sample MMD^2 with a Gaussian (median-bandwidth) kernel and a
-    permutation-calibrated p-value.  Model-agnostic 'are these two point clouds
-    different' test; returns ``(observed_mmd2, null_samples, p)``."""
-    rng = np.random.default_rng(PERM_SEED) if rng is None else rng
-    A, B = np.asarray(A, float), np.asarray(B, float)
-    Z = np.vstack([A, B])
-    n0, tot = len(A), len(Z)
-    sq = np.sum(Z * Z, 1)[:, None] + np.sum(Z * Z, 1)[None, :] - 2 * Z @ Z.T
-    np.maximum(sq, 0, out=sq)
-    K = np.exp(-sq / (np.median(sq[sq > 0]) + 1e-12))
-
-    def mmd2(i0, i1):
-        return (K[np.ix_(i0, i0)].mean() + K[np.ix_(i1, i1)].mean()
-                - 2 * K[np.ix_(i0, i1)].mean())
-
-    obs = mmd2(np.arange(n0), np.arange(n0, tot))
-    null = np.empty(n_perm)
-    for i in range(n_perm):
-        p = rng.permutation(tot)
-        null[i] = mmd2(p[:n0], p[n0:])
-    return obs, null, (1 + int(np.sum(null >= obs))) / (1 + n_perm)
-
-
-# --------------------------------------------------------------------------
-# uniformity / bias test -- for a nonce that must be uniform (y)
-# --------------------------------------------------------------------------
-def uniformity_divergence(samples, lo, hi, bins=UNIFORM_BINS, ref_counts=None):
-    """Chi-square divergence of a coefficient distribution from uniform (or from
-    a supplied golden reference histogram ``ref_counts``) over ``[lo, hi)``.
-
-    A fresh Dilithium nonce y is uniform on (-gamma1, gamma1]; a loop-abort
-    leaves a block of coefficients at a constant, spiking the histogram.  Returns
-    ``(chi2, dof, spike_fraction)`` where spike_fraction is the largest single
-    bin's share (a blunt 'how concentrated' readout)."""
-    x = np.asarray(samples, float).ravel()
-    edges = np.linspace(lo, hi, bins + 1)
-    obs, _ = np.histogram(x, bins=edges)
-    if ref_counts is None:
-        exp = np.full(bins, obs.sum() / bins, float)
-    else:
-        ref = np.asarray(ref_counts, float)
-        exp = ref * (obs.sum() / ref.sum())
-    exp = np.where(exp == 0, 1e-9, exp)
-    chi2 = float(np.sum((obs - exp) ** 2 / exp))
-    spike = float(obs.max() / obs.sum()) if obs.sum() else 0.0
-    return chi2, bins - 1, spike
-
-
-# --------------------------------------------------------------------------
-# spec-aware / rejection-boundary tests -- example 08
-# --------------------------------------------------------------------------
-def band_count(coeffs, bound):
-    """How many coefficients (across the flattened array) reach or exceed the
-    spec bound in magnitude -- the count that is 0 for every accepted golden
-    signature and non-zero once a rejection check is bypassed."""
-    return int(np.sum(np.abs(np.asarray(coeffs, float)) >= bound))
-
-
-def band_levene(golden, fault, band):
-    """Brown-Forsythe (median-centered Levene) equal-variance test restricted to
-    the edge band ``|coeff| >= band`` -- the localized second-order test that
-    sees the rejection-boundary spill a global variance test misses.  Returns
-    ``(W, p)`` or ``(nan, nan)`` if either side has too few band samples."""
-    from scipy import stats
-    g = np.abs(np.asarray(golden, float).ravel()); g = g[g >= band]
-    f = np.abs(np.asarray(fault, float).ravel()); f = f[f >= band]
-    if g.size < 3 or f.size < 3:
-        return float("nan"), float("nan")
-    return stats.levene(g, f, center="median")

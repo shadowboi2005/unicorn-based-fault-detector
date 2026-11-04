@@ -386,7 +386,7 @@ def skip_sweep(machine, target, captures_by_key, featurize, detect,
 
     `captures_by_key` is {key: [Capture, ...]}.
     `featurize(capture, output) -> feature`   (e.g. matched_filter(cap.c, unpack(out)))
-    `detect(features_by_key) -> dict`         (e.g. {'acc': two_key_accuracy(...)})
+    `detect(features_by_key) -> dict`         (e.g. {'metric': tvla_max(...)[0]})
     Returns per-site dicts: {'pc', 'text', 'crashed', 'ran', **detect_result}.
     """
     results = []

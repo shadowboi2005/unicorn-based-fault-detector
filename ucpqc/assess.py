@@ -23,15 +23,12 @@ from .faults import SKIP, FaultSpec, Injector
 from .machine import EmulationError
 from .replay import Recorder, skip_sweep
 
-# -- calibrated verdict (default): every LEAK is a permutation/analytic p-value
-# combined across the swept sites by a multiple-testing rule ------------------
-ALPHA = 0.01                           # per-test level (per_coord / uniformity analytic tail)
+# -- calibrated verdict (default): every LEAK is an analytic p-value combined
+# across the swept sites by a multiple-testing rule ---------------------------
+ALPHA = 0.01                           # per-test level (per_coord analytic tail)
 FDR_Q = 0.01                           # sweep-wide false-discovery-rate level (the verdict)
-DEFAULT_N_PERM = detectors.DEFAULT_N_PERM   # key-label shuffles per permutation test
-# -- legacy fixed thresholds (kept for --legacy-thresholds / calibrate=False) -
-LEAK_THRESHOLD = 0.80                  # two_key / subspace accuracy -> leak
-UNIFORMITY_SPIKE = 0.10                # bin share above which a nonce looks biased
-STRUCTURAL_THRESHOLD = 0.50            # structural_leak score -> leak
+DEFAULT_N_PERM = 1000                  # legacy knob kept for the CLI; per_coord uses the
+#                                        analytic TVLA tail, so it is unused by scoring
 DEFAULT_KEYS = (b"secret-key-AAAA", b"secret-key-BBBB")
 DEFAULT_N = 24
 CAP = 20_000_000
@@ -116,184 +113,51 @@ def _tvla_pvalue(max_t, d):
     return float(min(1.0, d * 2.0 * stats.norm.sf(max_t)))
 
 
-def _structural_nperm(n_perm):
-    """Cap the permutation count for the structural detector.  Its field-rank score
-    has a DEGENERATE null (~0 with no leak: permuted groups stay full rank), so the
-    studentised tail is razor-sharp -- a real collapse gets ``p_tail ~ 0`` and clears
-    a sweep-wide threshold at any site count, while golden stays at ``p = 1``.  A
-    small count therefore suffices, and the field rank (over a ~1024-wide matrix) is
-    the costly inner loop, so we cap it low."""
-    return min(n_perm, 60)
-
-
-# -- per-detector scoring ---------------------------------------------------
-# Each scorer maps (A, B, profile, calibrate, n_perm) -> (metric, pvalue):
-#   metric  -- the raw statistic, or None when there is too little data (the caller
-#              turns that into a crash row);
-#   pvalue  -- the calibrated per-site p-value, or None in legacy mode (where the
-#              verdict is the fixed threshold in the _DETECTORS registry instead).
-# The families differ only in HOW the p-value is calibrated: a key-label permutation
-# test (classifiers + structural + mmd), an exact analytic tail (per_coord,
-# uniformity), or certainty (a spec violation is not statistical).
+# -- per_coord scoring ------------------------------------------------------
+# The sole leak detector: per-coordinate TVLA.  Its scorer maps
+# (A, B, profile, calibrate, n_perm) -> (metric, pvalue):
+#   metric  -- max |t| over the output coordinates, or None when there is too little
+#              data (the caller turns that into a crash row);
+#   pvalue  -- the calibrated per-site p-value (the Bonferroni analytic TVLA tail),
+#              or None in legacy mode (where the verdict is the fixed threshold).
 
 def _feature_dim(A):
     return A.shape[1] if A.ndim > 1 else 1
 
 
-def _permutation_scored(stat, A, B, calibrate, n_perm):
-    """(metric, pvalue) for a statistic calibrated by a key-label permutation test."""
-    metric = float(stat(A, B))
-    if not calibrate:
-        return metric, None
-    _, p_emp, p_tail = detectors.perm_pvalue(stat, A, B, n_perm=n_perm)
-    return metric, detectors._resolve_p(p_emp, p_tail, n_perm)
-
-
-def _tail_resolved(obs, null, p_emp, n_perm):
-    """Resolve an empirical p-value below its floor using the Gaussian tail of a
-    precomputed null-sample array (for a detector that returns its own null)."""
-    from scipy import stats
-    sd = float(null.std(ddof=1))
-    z = (obs - float(null.mean())) / sd if sd > 0 else np.inf
-    return detectors._resolve_p(p_emp, float(stats.norm.sf(z)), n_perm)
-
-
-def _score_two_key(A, B, profile, calibrate, n_perm):
-    return _permutation_scored(detectors.two_key_accuracy, A, B, calibrate, n_perm)
-
-
-def _score_subspace(A, B, profile, calibrate, n_perm):
-    return _permutation_scored(detectors.lda_accuracy, A, B, calibrate, n_perm)
-
-
-def _score_structural(A, B, profile, calibrate, n_perm):
-    if profile.field is None:                     # scheme supplied no field-aware feature
-        return None, None
-    field = profile.field
-    stat = lambda a, b: detectors.structural_leak(a, b, field)   # noqa: E731
-    return _permutation_scored(stat, A, B, calibrate, _structural_nperm(n_perm))
-
-
-def _score_mmd(A, B, profile, calibrate, n_perm):
-    obs, null, p_emp = detectors.mmd_test(A, B, n_perm=n_perm)
-    if not calibrate:
-        return obs, None
-    return obs, _tail_resolved(obs, null, p_emp, n_perm)
-
-
 def _score_per_coord(A, B, profile, calibrate, n_perm):
+    """`per_coord`: max |t| over the output coordinates (:func:`detectors.tvla_max`),
+    with the Bonferroni analytic TVLA tail as the per-site p-value."""
     max_t, _ = detectors.tvla_max(A, B)
     return max_t, (None if not calibrate else _tvla_pvalue(max_t, _feature_dim(A)))
 
 
-def _score_uniformity(A, B, profile, calibrate, n_perm):
-    if len(A) < 1:
-        return None, None
-    pool = A.ravel()
-    chi2, dof, spike = detectors.uniformity_divergence(pool, pool.min(), pool.max())
-    if not calibrate:
-        return spike, None
-    from scipy import stats
-    return spike, float(stats.chi2.sf(chi2, dof))
-
-
-def _score_spec_aware(A, B, profile, calibrate, n_perm):
-    bound = getattr(profile, "reject_bound", None)
-    if bound is None or len(A) < 1:
-        return None, None
-    frac = detectors.band_count(A.ravel(), bound) / max(A.size, 1)
-    return frac, (0.0 if frac > 0 else 1.0)       # a spec violation is certain, not statistical
-
-
-def _score_differential(A, B, profile, calibrate, n_perm, golden=None):
-    """#3: flag a key-dependent fault EFFECT.  Per item the effect is the magnitude of
-    change from the golden (unfaulted) output, ``||faulted_z[i] - golden_z[i]||``, and
-    the detector asks whether that effect is key-separable -- i.e. the fault matters for
-    one key but not the other.  Magnitude (not the signed delta) keeps it nonce-neutral:
-    mask removal (delta = -y) changes both keys similarly and does NOT fire here (that
-    leak is two_key's); only a key-dependent *effectiveness* does.  Needs the golden
-    baseline (returns None without it)."""
-    if golden is None:
-        return None, None
-    gA = np.asarray(golden.get("A", []), float); gB = np.asarray(golden.get("B", []), float)
-    nA, nB = min(len(A), len(gA)), min(len(B), len(gB))
-    if nA < 3 or nB < 3:
-        return None, None
-    effect_A = np.linalg.norm(A[:nA] - gA[:nA], axis=1)[:, None]   # per-item change magnitude
-    effect_B = np.linalg.norm(B[:nB] - gB[:nB], axis=1)[:, None]
-    # the effects are same-sign magnitudes, so a Welch t (not the sign-based two_key
-    # classifier) is the right 2-sample test; metric is |t|, with the analytic tail.
-    max_t, _ = detectors.tvla_max(effect_A, effect_B)
-    return max_t, (None if not calibrate else _tvla_pvalue(max_t, 1))
-
-
-def _score_r0_reject(A, B, profile, calibrate, n_perm):
-    """#4 (Finding-a-Polytope): A = per-signing out-of-spec r0 coefficient counts (from
-    the profile's r0 observer).  Flag if ANY accepted signature had an out-of-spec r0
-    (coeffs >= gamma2-beta); `frac` is the share of such signatures.  Deterministic
-    (>0 is a real leak), like spec_aware but on the captured accepted r0."""
-    pool = np.asarray(A, float).ravel()
-    if pool.size < 1:
-        return None, None
-    frac = float(np.mean(pool > 0))
-    return frac, (0.0 if frac > 0 else 1.0)
-
-
-def _score_sifa(A, B, profile, calibrate, n_perm):
-    """SIFA: is the fault's INEFFECTIVENESS key-dependent?  A/B are per-item no-op
-    indicators (1 = faulted output identical to golden).  A two-proportion z-test on
-    the ineffective RATES flags a fault that is a no-op for one key but effective for
-    the other (the Statistical Ineffective Fault Analysis signal).  metric = |z|, with
-    the analytic normal tail; pooled-variance z (not Welch) so the extreme case
-    (rate 1 vs 0, both zero-variance) still flags."""
-    a = np.asarray(A, float).ravel(); b = np.asarray(B, float).ravel()
-    na, nb = a.size, b.size
-    if na < 3 or nb < 3:
-        return None, None
-    pooled = (a.sum() + b.sum()) / (na + nb)
-    se = (pooled * (1 - pooled) * (1 / na + 1 / nb)) ** 0.5
-    z = 0.0 if se == 0 else abs(a.mean() - b.mean()) / se
-    return z, (None if not calibrate else _tvla_pvalue(z, 1))
-
-
-# name -> (scorer, legacy_verdict).  legacy_verdict(metric, A) -> bool is the
-# pre-calibration fixed-threshold rule, kept beside each detector for
-# --legacy-thresholds.  Detectors in _TWO_SAMPLE compare against a whole population
-# and need >= 3 items per key; the rest guard inside their own scorer.
+# The only leak detector left under the instruction-skip scope is `per_coord`.
+# The registry shape is kept (name -> (scorer, legacy_verdict)) so the sweep /
+# funcskip / dump plumbing stays detector-indexed and a second leak detector can be
+# re-added without touching the engine.
 _DETECTORS = {
-    "two_key":    (_score_two_key,    lambda metric, A: metric >= LEAK_THRESHOLD),
-    "subspace":   (_score_subspace,   lambda metric, A: metric >= LEAK_THRESHOLD),
-    "structural": (_score_structural, lambda metric, A: metric >= STRUCTURAL_THRESHOLD),
-    "per_coord":  (_score_per_coord,  lambda metric, A: metric >= _tvla_threshold(_feature_dim(A))),
-    "mmd":        (_score_mmd,        lambda metric, A: False),   # calibrated-only detector
-    "uniformity": (_score_uniformity, lambda metric, A: metric > UNIFORMITY_SPIKE),
-    "spec_aware": (_score_spec_aware, lambda metric, A: metric > 0),
-    "r0_reject":  (_score_r0_reject,  lambda metric, A: metric > 0),   # #4: out-of-spec accepted r0 (Finding-a-Polytope)
-    "differential": (_score_differential, lambda metric, A: metric >= _tvla_threshold(1)),
-    "sifa":       (_score_sifa,       lambda metric, A: metric >= _tvla_threshold(1)),   # key-dependent ineffectiveness
+    "per_coord": (_score_per_coord, lambda metric, A: metric >= _tvla_threshold(_feature_dim(A))),
 }
-_TWO_SAMPLE = ("two_key", "subspace", "structural", "per_coord", "mmd",
-               "differential", "sifa")
+_TWO_SAMPLE = ("per_coord",)      # needs >= 3 items per key
 
 
 def _detector(name):
     try:
         return _DETECTORS[name]
     except KeyError:
-        raise ValueError(f"unknown detector {name!r}") from None
+        raise ValueError(f"unknown detector {name!r}; this build keeps only "
+                         f"{', '.join(_DETECTORS)}") from None
 
 
 def _score_and_pvalue(name, feats, profile, calibrate, n_perm, golden=None):
-    """Score one detector on the per-key feature lists -> (metric, pvalue), via its
-    scorer in the _DETECTORS registry.  `golden` (the control baseline's per-key
-    features) is only used by the `differential` detector."""
+    """Score `name` on the per-key feature lists -> (metric, pvalue) via its scorer
+    in the _DETECTORS registry.  `golden` is unused now (kept for signature
+    stability with the dump/funcskip callers)."""
     A = np.array(feats["A"]); B = np.array(feats.get("B", []))
     if name in _TWO_SAMPLE and (len(A) < 3 or len(B) < 3):
         return None, None
-    scorer = _detector(name)[0]
-    if name == "differential":
-        return scorer(A, B, profile, calibrate, n_perm, golden)
-    return scorer(A, B, profile, calibrate, n_perm)
+    return _detector(name)[0](A, B, profile, calibrate, n_perm)
 
 
 def _legacy_leak(name, metric, feats, profile):
@@ -326,43 +190,30 @@ class _Unstable(Exception):
 
 
 def _feature_for(profile, detector, machine, artifact):
-    """This detector's feature for one released signature: the raw response for the
-    `differential` detector (its effect is computed against the golden baseline),
-    the field-element feature for `structural`, else the real-valued classifier
-    feature."""
+    """The `per_coord` feature for one released signature: the challenge-aware
+    real-valued feature from the profile."""
     resp = profile.response_from_signature(artifact)
-    if detector in ("differential", "sifa"):
-        return np.asarray(resp, float).ravel()   # raw z; no challenge expansion needed
     c = profile.challenge(machine, artifact)
-    if detector == "structural":
-        return profile.structural_feature(c, resp)
     return profile.feature(c, resp)
 
 
 def _collect_key_features(scheme, profile, sk, messages, site, detector, budget, dump=False):
     """Sign every message under both keys with the site's whole-call skip installed,
-    turning each released signature into this detector's feature AND keeping the raw
+    turning each released signature into the `per_coord` feature AND keeping the raw
     artifact bytes.  Returns ``(feats, arts, chals, crashed, unstable)``; the raw
-    artifacts (paired with the golden baseline by nonce) feed the ineffective-fault and
-    differential measurements.  The `r0_reject` detector instead captures the accepted
-    r0 polyveck during signing (a scheme-internal quantity, via the profile's r0
-    observer) as its feature.  A crashed/hung signing or a wrong-length artifact
+    artifacts (paired with the golden baseline by nonce) feed the informational
+    ineffective-fault fraction.  A crashed/hung signing or a wrong-length artifact
     abandons the site (``unstable``), which then scores as a crash row.
 
-    With ``dump``, also record the expanded challenge ``c`` per item (``chals``) -- the
-    one emulator-derived context the classifier/structural detectors need -- so the
-    whole site is replayable offline (`assess_from_dump`).  Captured in the same
-    signing context the live feature uses, for *every* detector (not just the ones
-    whose feature already expands ``c``).  Empty when ``dump`` is off or the profile
-    exposes no ``challenge``, so the hot path is unchanged."""
+    With ``dump``, also record the expanded challenge ``c`` per item (``chals``) so the
+    whole site is replayable offline (`assess_from_dump`).  Empty when ``dump`` is off
+    or the profile exposes no ``challenge``, so the hot path is unchanged."""
     m = scheme.machine
     feats = {"A": [], "B": []}
     arts = {"A": [], "B": []}
     chals = {"A": [], "B": []}
     want_chal = dump and hasattr(profile, "challenge")
     crashed = 0
-    obs = (profile.r0_observer(m) if detector == "r0_reject"
-           and hasattr(profile, "r0_observer") else None)
     try:
         for key in "AB":
             m.stub_randombytes(f"nonce-{key}".encode())
@@ -380,10 +231,7 @@ def _collect_key_features(scheme, profile, sk, messages, site, detector, budget,
                         crashed += 1
                         raise _Unstable
                     arts[key].append(bytes(art))
-                    if obs is not None:                   # r0_reject: per-signing out-of-spec r0 count
-                        feats[key].append(obs.take())
-                    else:
-                        feats[key].append(_feature_for(profile, detector, m, art))
+                    feats[key].append(_feature_for(profile, detector, m, art))
                     if want_chal:                         # dump context: c as ints, replayable offline
                         chals[key].append([int(x) for x in profile.challenge(m, art)])
             except _Unstable:
@@ -394,9 +242,6 @@ def _collect_key_features(scheme, profile, sk, messages, site, detector, budget,
     except EmulationError:                       # a fault outside signing (e.g. re-expanding c)
         empty = {"A": [], "B": []}
         return empty, {"A": [], "B": []}, {"A": [], "B": []}, len(messages), True
-    finally:
-        if obs is not None:
-            obs.detach()
     return feats, arts, chals, crashed, False
 
 
@@ -414,20 +259,6 @@ def _ineffective_fraction(arts, golden_arts):
                 total += 1
                 same += (art == g[i])
     return (same / total) if total else None
-
-
-def _sifa_feats(arts, golden):
-    """Per-item ineffective indicators per key (1.0 = faulted output byte-identical to
-    golden, i.e. the fault was a no-op) -- the SIFA detector's feature.  Empty without
-    a golden baseline (the control row)."""
-    if golden is None:
-        return {"A": [], "B": []}
-    g = golden["arts"]
-    out = {}
-    for key in ("A", "B"):
-        gk, ak = g.get(key, []), arts.get(key, [])
-        out[key] = [[1.0 if ak[i] == gk[i] else 0.0] for i in range(min(len(ak), len(gk)))]
-    return out
 
 
 def _provisional_status(site, feats, metric, calibrate, detector, profile):
@@ -451,7 +282,7 @@ def _run_site(scheme, profile, sk, messages, site, label, detector, budget,
     parallel backends share it and produce identical rows.  `site` is an int address,
     or None for the control row.  `golden` is the control row's `collected` data
     (``{feats, arts}``); the caller feeds the control's output back in as the baseline
-    for every faulted site (ineffective-fault metric and differential detector).
+    for the informational ineffective-fault fraction.
 
     Site isolation matters: a faulted/hung signing leaves the guest dirty, so without
     a reset the next site inherits that state and its verdict depends on execution
@@ -467,13 +298,8 @@ def _run_site(scheme, profile, sk, messages, site, label, detector, budget,
         m.restore(guard)                         # isolate the next site from this one
     if unstable:
         metric, pvalue = None, None
-    elif detector == "sifa":                     # feature = per-item no-op indicators vs golden
-        metric, pvalue = _score_and_pvalue("sifa", _sifa_feats(arts, golden), profile,
-                                           calibrate, n_perm)
     else:
-        golden_feats = golden["feats"] if golden else None
-        metric, pvalue = _score_and_pvalue(detector, feats, profile, calibrate, n_perm,
-                                            golden_feats)
+        metric, pvalue = _score_and_pvalue(detector, feats, profile, calibrate, n_perm)
     status = _provisional_status(site, feats, metric, calibrate, detector, profile)
     ran = len(feats["A"]) + len(feats["B"])
     ineffective = None if site is None else _ineffective_fraction(
@@ -558,30 +384,25 @@ def _dump_records(collected, messages):
 # --------------------------------------------------------------------------
 # offline replay -- run any detector on a dumped sweep, no emulator
 # --------------------------------------------------------------------------
-DUMP_DETECTORS = tuple(d for d in _DETECTORS if d != "r0_reject")
+DUMP_DETECTORS = tuple(_DETECTORS)
 
 
 def _feature_from_record(profile, detector, rec):
-    """Reconstruct one detector feature from a dump record -- the offline dual of
+    """Reconstruct the `per_coord` feature from a dump record -- the offline dual of
     `_feature_for`, sourcing the challenge from the record instead of the emulator.
     The profile methods it calls are all pure (no machine)."""
     resp = profile.response_from_signature(bytes.fromhex(rec["artifact"]))
-    if detector in ("differential", "sifa"):
-        return np.asarray(resp, float).ravel()
     if "challenge" not in rec:
         raise ValueError(f"detector {detector!r} needs the challenge, which this dump "
-                         f"does not carry; re-dump, or use an artifact-only detector "
-                         f"({', '.join(sorted(set(DUMP_DETECTORS) - {'differential', 'sifa'}))})")
+                         f"does not carry; re-dump with this version")
     c = np.array(rec["challenge"], float)
-    if detector == "structural":
-        return profile.structural_feature(c, resp)
     return profile.feature(c, resp)
 
 
 def _feats_arts_from_records(profile, detector, records):
     """Rebuild one site's (feats, arts) from its per-key dump records, so the shared
-    scoring path (`_score_and_pvalue`, `_sifa_feats`, `_ineffective_fraction`) runs
-    on dumped data exactly as on live-collected data."""
+    scoring path (`_score_and_pvalue`, `_ineffective_fraction`) runs on dumped data
+    exactly as on live-collected data."""
     feats = {"A": [], "B": []}
     arts = {"A": [], "B": []}
     for key in ("A", "B"):
@@ -594,13 +415,7 @@ def _feats_arts_from_records(profile, detector, records):
 def _score_dump_row(site, label, feats, arts, golden, detector, profile, calibrate, n_perm):
     """Score one reconstructed site into a `SiteResult` -- the scoring tail of
     `_run_site`, shared so an offline row is identical to its live counterpart."""
-    if detector == "sifa":
-        metric, pvalue = _score_and_pvalue("sifa", _sifa_feats(arts, golden), profile,
-                                           calibrate, n_perm)
-    else:
-        golden_feats = golden["feats"] if golden else None
-        metric, pvalue = _score_and_pvalue(detector, feats, profile, calibrate, n_perm,
-                                            golden_feats)
+    metric, pvalue = _score_and_pvalue(detector, feats, profile, calibrate, n_perm)
     status = _provisional_status(site, feats, metric, calibrate, detector, profile)
     ran = len(feats["A"]) + len(feats["B"])
     ineffective = None if site is None else _ineffective_fraction(
@@ -612,15 +427,10 @@ def _score_dump_row(site, label, feats, arts, golden, detector, profile, calibra
 def assess_from_dump(dump_dir, detector="per_coord", calibrate=True, n_perm=DEFAULT_N_PERM,
                      fdr_q=FDR_Q, correction="bh"):
     """Re-run `detector` on a dumped sweep (`ucpqc.dump`) with NO emulator, returning
-    an `AssessmentResult` identical to a live `sweep_sites` with the same detector and
-    calibration -- the whole point of `--dump`: capture once, score any detector in
-    seconds.  `r0_reject` is not replayable (its data only exists under the
-    force-r0-accept path, which the skip sweep never captures)."""
+    an `AssessmentResult` identical to a live `sweep_sites` -- the whole point of
+    `--dump`: capture once, score offline in seconds."""
     from . import dump as dumpmod
     from .profiles import profile_by_name
-    if detector == "r0_reject":
-        raise ValueError("r0_reject is not replayable from a skip-sweep dump (its data "
-                         "only exists under force-r0-accept); re-run it live")
     meta, golden_records, site_dumps = dumpmod.load_dump(dump_dir)
     profile = profile_by_name(meta["scheme"])
 
@@ -673,13 +483,12 @@ def _capture_funcskip(scheme, profile, target, backend, keys, n, key_mode="indep
 
 
 def _funcskip_feature(profile, detector, cap_c, out):
-    """One funcskip feature from a (possibly faulted) function output `out` and the
-    per-item challenge `cap_c`.  Robust to any output shape: a polyvecl buffer decodes
-    via the profile, so the challenge-aware matched filter / structural feature apply
-    (preserving the default two_key / uniformity behaviour on polyvecl_add and the y
-    sampler); any other buffer is unpacked as raw int32, and a scalar return value
-    becomes a 1-vector -- so new targets (poly_challenge, ntt, poly_chknorm) featurize
-    without a per-target decoder."""
+    """The `per_coord` funcskip feature from a (possibly faulted) function output `out`
+    and the per-item challenge `cap_c`.  Robust to any output shape: a polyvecl buffer
+    decodes via the profile, so the challenge-aware matched filter applies (the
+    polyvecl_add leak); any other buffer is unpacked as raw int32, and a scalar return
+    value becomes a 1-vector -- so new targets (poly_challenge, ntt, poly_chknorm)
+    featurize without a per-target decoder."""
     if isinstance(out, (bytes, bytearray)):
         try:
             resp, shaped = profile.response_from_output(bytes(out)), True   # polyvecl -> (L, N)
@@ -687,11 +496,9 @@ def _funcskip_feature(profile, detector, cap_c, out):
             resp, shaped = np.frombuffer(bytes(out), dtype="<i4").astype(float), False
     else:                                              # a scalar return value (out == "ret")
         resp, shaped = np.array([float(out)]), False
-    if shaped and cap_c is not None and detector in ("two_key", "per_coord", "subspace"):
+    if shaped and cap_c is not None:
         return profile.feature(cap_c, resp)
-    if shaped and cap_c is not None and detector == "structural":
-        return profile.structural_feature(cap_c, resp)
-    return np.asarray(resp, float).ravel()             # uniformity / spec_aware / non-polyvecl
+    return np.asarray(resp, float).ravel()             # non-polyvecl buffer / scalar return
 
 
 def _make_featurize(profile, detector):
@@ -746,7 +553,7 @@ def sweep_function(scheme, profile, target=None, keys=DEFAULT_KEYS, n=DEFAULT_N,
     (`assess_funcskip_from_dump`) without re-capturing/replaying."""
     m = scheme.machine
     target = target or profile.default_target()
-    detector = detector or profile.detector_for(target)
+    detector = detector or "per_coord"
     caps_by_key = _capture_funcskip(scheme, profile, target, backend, keys, n, key_mode)
     featurize = _make_featurize(profile, detector)
     detect = _make_detect(profile, detector, calibrate, n_perm)

@@ -340,7 +340,6 @@ def test_profile_auto_selection():
     addrs = {a for a, _ in prof.fault_sites(m, op)}     # auto-discovered
     assert 0x4d5e in addrs, "the z=z+y mask add is discovered"
     assert len(addrs) > 20, "discovery is a superset of the old curated table"
-    assert prof.detector_for(prof.default_target()) == "two_key"
 
 
 def test_profile_feature_roundtrip():
@@ -383,85 +382,7 @@ def test_mayo_runs_and_selects_profile():
     assert scheme.verify(scheme.sign(b"hi", sk), b"hi", pk)
 
 
-# --- structural-detector field math (pure; no external oracle) --------------
-
-
-def test_ring_deconv_recovers_s1():
-    """The structural feature's Z_q ring deconvolution recovers s1 from z=c*s1."""
-    import numpy as np
-    from ucpqc.profiles.mldsa import negacyclic_deconv, Q, N_COEFFS as n, TAU
-    rng = np.random.default_rng(0)
-    s1 = rng.integers(0, Q, size=(2, n))
-    c = np.zeros(n, dtype=int)
-    c[rng.choice(n, TAU, replace=False)] = rng.choice([1, Q - 1], TAU)  # sparse +-1
-
-    def negconv(a, b):                       # reference z = a*b mod (x^n+1, Q)
-        lin = np.zeros(2 * n - 1, dtype=object)
-        for i in range(n):
-            if a[i]:
-                for j in range(n):
-                    lin[i + j] = (lin[i + j] + int(a[i]) * int(b[j])) % Q
-        return np.array([(lin[k] - (lin[k + n] if k + n < 2 * n - 1 else 0)) % Q
-                         for k in range(n)], dtype=object)
-
-    z = np.array([negconv(c, s1[r]) for r in range(2)], dtype=object)
-    assert np.array_equal(negacyclic_deconv(c, z) % Q, s1 % Q), "must recover s1"
-
-
-def test_field_rank_known():
-    """Hand-rolled GF(q) and GF(16) ranks on matrices with known rank."""
-    import numpy as np
-    from ucpqc.detectors import PrimeField, GF2m
-    full = np.eye(4, dtype=int) * 3                       # rank 4 (3 is a unit)
-    deficit = np.array([[1, 1, 0, 0], [1, 1, 0, 0],       # row 0 duplicated -> rank 3
-                        [0, 0, 1, 0], [0, 0, 0, 1]], dtype=int)
-    for F in (PrimeField(8380417), GF2m(4)):
-        assert F.rank(full) == 4, f"{F.name} full rank"
-        assert F.rank(deficit) == 3, f"{F.name} rank deficit"
-
-
-# --- calibrated detectors: permutation p-values + multiple-testing ----------
-
-
-def test_perm_pvalue_calibrated():
-    """perm_pvalue: no separation is not significant; a planted leak floors the
-    empirical p (flagged); and _resolve_p uses the Gaussian tail only when it is at
-    the floor AND the tail is smaller."""
-    import numpy as np
-    from ucpqc.detectors import perm_pvalue, two_key_accuracy, _resolve_p
-    rng = np.random.default_rng(1)
-    A = rng.normal(size=(12, 8)); B = rng.normal(size=(12, 8))       # same distribution
-    _, pe, pt = perm_pvalue(two_key_accuracy, A, B, n_perm=500, rng=np.random.default_rng(2))
-    assert _resolve_p(pe, pt, 500) > 0.05, "no separation -> not significant"
-    A2 = rng.normal(3.0, 1.0, size=(12, 8))                          # planted leak: opposite
-    B2 = rng.normal(-3.0, 1.0, size=(12, 8))                         # means (both off-origin)
-    _, pe2, pt2 = perm_pvalue(two_key_accuracy, A2, B2, n_perm=500, rng=np.random.default_rng(3))
-    assert pe2 <= 1.0 / 501 + 1e-12, "the leak beats every permutation (empirical floor)"
-    assert _resolve_p(pe2, pt2, 500) <= 1.0 / 501 + 1e-12, "flagged at (or below) the floor"
-    # the resolution rule itself: tail is used only at the floor, only when smaller
-    floor = 1.0 / 501
-    assert _resolve_p(0.5, 1e-9, 500) == 0.5, "an unfloored empirical p ignores the tail"
-    assert _resolve_p(floor, 1e-9, 500) == 1e-9, "floored + smaller tail -> use the tail"
-    assert _resolve_p(floor, 0.3, 500) == floor, "floored + larger tail -> keep the floor"
-
-
-def test_perm_pvalue_generalizes():
-    """The one calibrator wraps the whole repertoire: lda_accuracy and a
-    structural_leak closure both flag a planted leak through perm_pvalue."""
-    import numpy as np
-    from ucpqc.detectors import (perm_pvalue, lda_accuracy, structural_leak,
-                                 PrimeField, _resolve_p)
-    rng = np.random.default_rng(4)
-    A = rng.normal(3.0, 1.0, size=(10, 6)); B = rng.normal(-3.0, 1.0, size=(10, 6))
-    _, pe, pt = perm_pvalue(lda_accuracy, A, B, n_perm=300, rng=np.random.default_rng(5))
-    assert _resolve_p(pe, pt, 300) < 0.01, "lda separates the planted shift"
-    q = 8380417                                              # Z_q: each key a repeated row
-    FA = np.tile(rng.integers(0, q, size=6), (8, 1))
-    FB = np.tile(rng.integers(0, q, size=6), (8, 1))
-    field = PrimeField(q)
-    _, pe2, pt2 = perm_pvalue(lambda a, b: structural_leak(a, b, field), FA, FB,
-                              n_perm=200, rng=np.random.default_rng(6))
-    assert _resolve_p(pe2, pt2, 200) < 0.02, "collapsed key-specific subspaces flag"
+# --- calibrated detectors: multiple-testing corrections ---------------------
 
 
 def test_multiple_testing_corrections():
@@ -502,25 +423,6 @@ def test_ineffective_fraction():
     assert _ineffective_fraction(faulted, None) is None          # no baseline
 
 
-def test_differential_detector():
-    """#3: differential flags a key-dependent fault effect (A barely touched, B changed
-    a lot) and stays quiet on a symmetric effect (nonce-neutral change magnitude)."""
-    import numpy as np
-    from ucpqc.assess import _score_differential
-    rng = np.random.default_rng(0)
-    D, N = 16, 12
-    gA = rng.normal(size=(N, D)); gB = rng.normal(size=(N, D))      # golden baselines
-    A = gA + rng.normal(0, 0.05, size=(N, D))                      # fault barely affects A
-    B = gB + rng.normal(0, 3.0, size=(N, D))                       # ... changes B a lot
-    _, p = _score_differential(A, B, None, True, 300, golden={"A": gA, "B": gB})
-    assert p is not None and p < 0.01, f"key-dependent effect flags (p={p})"
-    A2 = gA + rng.normal(0, 3.0, size=(N, D))                      # both changed similarly
-    B2 = gB + rng.normal(0, 3.0, size=(N, D))
-    _, p2 = _score_differential(A2, B2, None, True, 300, golden={"A": gA, "B": gB})
-    assert p2 > 0.01, f"symmetric effect is not key-dependent (p={p2})"
-    assert _score_differential(A, B, None, True, 300, golden=None) == (None, None)
-
-
 def test_sibling_key():
     """#1: sibling_key yields a secret key differing by exactly one byte in the s1
     region; s1 changes and both keys still sign."""
@@ -537,49 +439,8 @@ def test_sibling_key():
     assert len(scheme.sign(b"hi", skA)) == len(scheme.sign(b"hi", skB)) == 2420, "both sign"
 
 
-def test_r0_reject_detector():
-    """#4 (Finding-a-Polytope): forcing the r0 rejection check to accept releases an
-    out-of-spec r0, which the r0 observer counts; a normal accepted r0 is in spec."""
-    from ucpqc.profiles import profile_for
-    m, scheme = booted(seed=b"polytope")
-    prof = profile_for(scheme); prof.setup(m)
-    _, sk = scheme.keypair()
-
-    obs = prof.r0_observer(m)                      # normal: every accepted r0 in spec
-    oob_normal = sum(_sign_take(scheme, f"n{i}".encode(), sk, obs) for i in range(8))
-    obs.detach()
-    assert oob_normal == 0, "golden accepted r0 is always in spec"
-
-    forced = prof.force_r0_accept(m)              # the fault: out-of-spec r0 released
-    oob_forced = sum(_sign_take(scheme, f"f{i}".encode(), sk, forced) for i in range(16))
-    forced.detach()
-    assert oob_forced > 0, "forcing r0-accept releases out-of-spec r0 (the leak)"
-
-
-def _sign_take(scheme, msg, sk, cap):
-    scheme.sign(msg, sk)
-    return cap.take()
-
-
-def test_sifa_detector():
-    """SIFA: a fault whose ineffectiveness is key-dependent (no-op for one key,
-    effective for the other) is flagged; a key-independent no-op rate is not."""
-    import numpy as np
-    from ucpqc.assess import _score_sifa
-
-    def ind(rate, n=20, seed=0):                 # per-item no-op indicators at a given rate
-        return (np.random.default_rng(seed).random(n) < rate).astype(float)[:, None]
-
-    _, p = _score_sifa(ind(1.0), ind(0.0), None, True, 0)        # extreme: A no-op, B effective
-    assert p is not None and p < 1e-3, f"extreme SIFA flags (p={p})"
-    _, p2 = _score_sifa(ind(0.2, 40, 1), ind(0.8, 40, 2), None, True, 0)   # partial 20% vs 80%
-    assert p2 < 0.01, f"partial SIFA flags (p={p2})"
-    _, p3 = _score_sifa(ind(0.5, 40, 3), ind(0.5, 40, 4), None, True, 0)   # same rate -> no SIFA
-    assert p3 > 0.05, f"key-independent ineffectiveness is not SIFA (p={p3})"
-
-
 # --- dump + offline detect --------------------------------------------------
-def _dump_small(detector="two_key", n=5, nsites=2):
+def _dump_small(detector="per_coord", n=5, nsites=2):
     """Run a tiny sweep with --dump into a temp dir (first `nsites` discovered sites,
     so it stays fast) and return (dump_dir, live AssessmentResult)."""
     import tempfile
@@ -619,8 +480,8 @@ def test_detect_matches_live():
     -- same metric, p-value, status, and ineffective fraction per site (capture once,
     score offline without re-emulating)."""
     from ucpqc import assess
-    d, live = _dump_small(detector="two_key", n=6, nsites=2)
-    off = assess.assess_from_dump(d, detector="two_key")
+    d, live = _dump_small(detector="per_coord", n=6, nsites=2)
+    off = assess.assess_from_dump(d, detector="per_coord")
     assert len(off.rows) == len(live.rows)
     for lr, orr in zip(live.rows, off.rows):
         assert lr.addr == orr.addr
@@ -631,21 +492,17 @@ def test_detect_matches_live():
 
 
 def test_detect_reuses_dump():
-    """One dump feeds several detectors offline: the whole point of --dump is to run a
-    different detector without re-emulating.  Capture under two_key, then score both
-    two_key and structural (a different feature) off the same files."""
+    """A dump is replayable offline without re-emulating: scoring per_coord off the
+    captured files reproduces the dump's scored rows, and an unknown detector is
+    rejected."""
     from ucpqc import assess
-    d, _ = _dump_small(detector="two_key", n=6, nsites=2)
-    r_two = assess.assess_from_dump(d, detector="two_key")
-    r_struct = assess.assess_from_dump(d, detector="structural")       # different feature, same dump
-    assert len(r_two.rows) == len(r_struct.rows) == 3
-    assert r_two.detector == "two_key" and r_struct.detector == "structural"
-    # both produce a scored (non-crash) faulted row from the same captured artifacts
-    assert any(r.metric is not None for r in r_two.rows[1:])
-    assert any(r.metric is not None for r in r_struct.rows[1:])
+    d, _ = _dump_small(detector="per_coord", n=6, nsites=2)
+    r = assess.assess_from_dump(d, detector="per_coord")
+    assert len(r.rows) == 3 and r.detector == "per_coord"
+    assert any(row.metric is not None for row in r.rows[1:])    # a scored faulted row
     try:
-        assess.assess_from_dump(d, detector="r0_reject")
-        assert False, "r0_reject should be rejected for a skip-sweep dump"
+        assess.assess_from_dump(d, detector="sifa")             # removed detector
+        assert False, "an unknown detector should be rejected"
     except ValueError:
         pass
 
@@ -717,11 +574,31 @@ def test_funcskip_dumpdir_resolves():
     out = os.path.join(base, "polyvecl_add_instrskip")
     assert os.path.isdir(out), f"expected dump dir {out}"
     assert os.path.exists(os.path.join(out, "meta.json")), "meta.json written under the base dir"
-    # the dump carries golden outputs, so the candidate counter can score phi_IF from it
+    # the candidate counter reads the dump and scores per_coord LEAK counts from it
     from ucpqc import candidates
     c = candidates.candidate_counts(base)["polyvecl_add"]
     assert c["reached"] and c["scored"] > 0, f"candidate counts read the dump: {c}"
-    assert c["maxineff"] > 0, "ineffective axis populated from the dump's golden outputs"
+    assert c["maxineff"] > 0, "ineffective fraction populated from the dump's golden outputs"
+
+
+def test_per_position_phi_runs():
+    """ucpqc.phi (per-position phi_IF, the ineffective axis) runs on the clean build and
+    returns well-formed ranked witnesses; when it flags, the position carries an s1
+    coefficient attribution via profile.secret_coeffs."""
+    from ucpqc import phi
+    from ucpqc.profiles import profile_for
+    need(DILITHIUM_REF)
+    m = Machine.from_elf(DILITHIUM_REF)
+    scheme = Scheme.bind(m)
+    m.boot()
+    prof = profile_for(scheme)
+    res = phi.per_position_phi(scheme, prof, sites="polyvecl_add", k=4)
+    assert res.k == 4 and len(res.sites) == 1, "one resolved site, K recorded"
+    s = res.sites[0]
+    assert "polyvecl_add" in s.label
+    assert isinstance(s.witnesses, list) and s.n_split >= len(s.witnesses)
+    if s.witnesses:                                  # stochastic; attribution when it flags
+        assert "coeff[" in s.attribution, s.attribution
 
 
 def test_parallel_sweep_matches_serial():

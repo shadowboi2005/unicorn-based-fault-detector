@@ -46,9 +46,6 @@ class AnalysisProfile:
     artifact_len = 0
     #: default funcskip target (a symbol name or a replay.Target), or None
     default_target = None
-    #: arithmetic backend for the "structural" detector (a detectors.Field), or
-    #: None if the scheme supplies no field-aware structural feature yet
-    field = None
 
     # -- lifecycle ----------------------------------------------------------
     def setup(self, machine):
@@ -85,28 +82,17 @@ class AnalysisProfile:
         raise NotImplementedError
 
     def feature(self, context, response):
-        """Combine context + response into a detector feature vector (e.g. the
+        """Combine context + response into the `per_coord` feature vector (e.g. the
         matched filter of `c` against the response)."""
         raise NotImplementedError
 
-    def structural_feature(self, context, response):
-        """Map one (context, response) into a row of FIELD ELEMENTS over
-        ``self.field`` for the "structural" detector -- built so a leak shows up
-        as a low-rank, key-dependent subspace.  Distinct from ``feature`` (a
-        real-valued classifier feature): the structural leak is *algebraic*.
-        Where the leak lives is the scheme's job to express (e.g. MAYO: the
-        exposed oil bytes as GF(16) elements; Dilithium: the per-signature ``s1``
-        estimate over Z_q, deconvolving the known challenge from the response).
-        Only needed if the profile sets ``field`` and offers the "structural"
-        detector.  Default: unsupported."""
-        raise NotImplementedError
-
-    # -- detector role mapping ----------------------------------------------
-    def detector_for(self, target):
-        """Which detector fits a target: "two_key" (secret-masked response),
-        "uniformity" (a nonce that must be uniform), or "spec_aware" (a
-        rejection-bound quantity).  Default: two_key."""
-        return "two_key"
+    # -- secret attribution (per-position phi_IF) ---------------------------
+    def secret_coeffs(self, sk):
+        """Decode the secret key `sk` into a labelled coefficient array, so the
+        per-position phi_IF detector (`ucpqc.phi`) can attribute a flagged output
+        position to a specific secret coefficient.  Default: None (no attribution;
+        positions are reported by index).  Override per scheme (e.g. ML-DSA's s1)."""
+        return None
 
     # -- controlled key difference (#1) -------------------------------------
     def sibling_key(self, sk):
@@ -197,8 +183,8 @@ def profile_by_name(name):
     """Select the profile for a scheme *name string* alone -- no `scheme` object and
     no machine.  Used by the offline `detect` path (:func:`assess.assess_from_dump`),
     which reconstructs features from a dump: the methods it calls
-    (`response_from_signature`, `feature`, `structural_feature`) never touch the
-    emulator.  Same name matching as :func:`profile_for`."""
+    (`response_from_signature`, `feature`) never touch the emulator.  Same name
+    matching as :func:`profile_for`."""
     for cls in profiles:
         if any(fnmatch.fnmatch(name, pat) for pat in cls.patterns):
             return cls()
