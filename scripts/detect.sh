@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Re-run a detector OFFLINE on a dumped sweep or funcskip capture (no emulator).
-# Usage:  scripts/detect.sh DUMPDIR [extra ucpqc args, e.g. --detector structural]
+# Usage:  scripts/detect.sh DUMPDIR [extra ucpqc args, e.g. --detector per_coord]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/_venv.sh
