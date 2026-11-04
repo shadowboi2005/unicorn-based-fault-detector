@@ -198,7 +198,7 @@ class MLDSAProfile(AnalysisProfile):
                                    args=(("in", POLY_BYTES), "scalar"), out="ret",
                                    label="poly_chknorm (rejection check)"),
         }
-        return {**dilithium_targets.TARGETS, **curated}
+        return {**dilithium_targets.TARGETS, **dilithium_targets.M4F_TARGETS, **curated}
 
     def default_target(self):
         """The z = z + y mask add -- the intra-function funcskip target."""

@@ -52,6 +52,11 @@ class Target:
                output buffer.  Empty => output is the return value.
     `out`   -- "ret" (return value) or an argument index whose buffer is the
                output.
+    `caller`-- optional function symbol: only invocations whose return address
+               lies inside it are counted (and `nth` indexes among those).  Picks
+               the operand role of a function called from several places, e.g.
+               `ntt` from `polyvecl_ntt` (NTT(y)) vs from the signing body
+               (NTT(c)).  Tail-call thunks keep LR in the real caller.
     """
     func: object = None
     region: tuple = None
@@ -59,6 +64,7 @@ class Target:
     args: tuple = ()
     out: object = "ret"
     label: str = ""
+    caller: str = None
 
     def out_size(self):
         return 0 if self.out == "ret" else int(self.args[self.out][1])
@@ -137,6 +143,8 @@ class Recorder:
         self._count = 0
         self._pending = None
         self._result = None
+        self._caller = (machine.image.extent_of(target.caller)
+                        if target.caller is not None else None)
         if target.func is not None:
             self.entry = machine.addr_of(target.func)
             self._trig = Trigger(machine, target.func, nth=0,
@@ -181,6 +189,10 @@ class Recorder:
             cap.golden_output = mm.read(cap.out_ptr, self.target.out_size())
 
     def _on_arm(self, mm):
+        if self._caller is not None:                 # count only calls from `caller`
+            lo, hi = self._caller
+            if not lo <= self._trig._ret < hi:
+                return
         self._count += 1
         if self._is_target(self._count):
             self._pending = self._grab_entry(mm, self._trig._ret)

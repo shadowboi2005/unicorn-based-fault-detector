@@ -129,11 +129,12 @@ P(f"- **φIF (key-dependent ineffective -- SIFA *candidate* surface):** {phi_tot
   "key-dependence with ordinary input-dependence, so this *locates candidate sites* rather than proving SIFA-exploitability. "
   "Publicness of the driving value does NOT rule a site out (SIFA exploits an ineffective-conditioned *bias*, which can arise "
   "even for public operands); deciding each site needs the SIFA test proper (fix the key, fault across many inputs, filter to "
-  "the ineffective subset, test the conditional bias). The signal is heaviest in the NTT butterflies.")
-P("- The m4f optimising compiler **inlines 8 of the reference functions out of the signing path** "
+  "the ineffective subset, test the conditional bias). (The large `ntt` cluster is NTT of the public challenge; see the correction below.)")
+P("- 8 of the reference functions are **not called in m4f signing** "
   "(`polyveck_add/sub/chknorm/make_hint`, the `c·s` `*_pointwise_poly_montgomery` multiplies, "
-  "`polyvecl_invntt_tomont`/`pointwise_acc`), so the ARM fault surface is **smaller** than the IR the LLVM tool "
-  "analysed -- compilation itself changes what can be faulted.\n")
+  "`polyvecl_invntt_tomont`/`pointwise_acc`). The c·s products are not inlined away: m4f computes them on a "
+  "separate mod-769 small-NTT path (`*_small_basemul_invntt`, `small_*_asm_769`) that the reference function list "
+  "cannot name; it is swept in `report/dilithium_m4f_secret_path.md`.\n")
 P("The two axes below come from **two different detectors** -- do not conflate them:\n")
 P("- **(A) distribution-difference** (`per_coord`/TVLA): the faulted *output distribution* differs by key")
 P("  (the *correction* analog -- a key LEAK).")
@@ -176,11 +177,13 @@ for fn, a in sorted(_phi, key=lambda t: -t[1]["phi_sites"]):
     if len(d) > TOP:
         P(f"| ... | | +{len(d)-TOP} more sites |")
     P("")
-P("In `ntt` the φIF sites are the Montgomery-multiply butterfly ops (`smull`/`smlal`/`mul`/`add`): skipping one "
-  "is a no-op exactly when that key's coefficient makes the product irrelevant, so the no-op pattern tracks the "
-  "(secret-derived) NTT operands -- the strongest φIF signal here, and the natural place for it since the `m4f` "
-  "compiler inlined the `c·s` `*_pointwise_poly_montgomery` multiplies away. Whether this is SIFA-exploitable still "
-  "needs the ineffective-conditioned-bias test (see caveat above).\n")
+P("**Correction (see `report/dilithium_m4f_secret_path.md`).** The `ntt` target captures the LAST `ntt` call "
+  "in a signing, which is `poly_ntt(&cp)`: the NTT of the **public challenge c** (byte-identical captured input "
+  "to the caller-filtered `ntt_c`). c has only 39 non-zero coefficients, so whether a skipped butterfly is a no-op "
+  "tracks where c's zeros fall, and c differs between keys A and B. A same-key control (key A vs key A on 40 other "
+  "messages) gives 56 sites / 240 flips against A/B's 63 / 261, and **no site's A/B flip rate is significantly above "
+  "the control** (Fisher exact, BH-FDR 0.05): these φIF sites are input-dependence on a public value, not "
+  "key-dependence. The same holds for `poly_challenge`, `polyvecl_uniform_gamma1` and `poly_chknorm`.\n")
 
 P("## Per-function\n")
 P("| function | LLVM ineff | LLVM corr | ARM leak (LEAK/scored, max\\|t\\|) | ARM φIF sites (flips) | note |")

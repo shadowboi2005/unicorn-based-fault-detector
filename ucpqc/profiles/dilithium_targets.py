@@ -69,6 +69,76 @@ TARGETS = {
         _t("polyvec_matrix_pointwise_montgomery", (("out", _V), ("in", _MAT), ("in", _V))),
 }
 
+#: Operand-role and m4f-specific targets.  The `TARGETS` above follow the LLVM project's
+#: reference function list and capture the LAST call in a signing (`nth=-1`), which for a
+#: function called on several operands silently fixes the operand: the last `ntt` call is
+#: `poly_ntt(&cp)` (the PUBLIC challenge), the last `invntt_tomont` is c*t0[K-1].  Here a
+#: `caller` filter picks the operand role instead.  And m4f does NOT compute c*s1 / c*s2
+#: with the reference `*_pointwise_*montgomery` functions: it uses a separate mod-769
+#: "small NTT" path (`smallntt.h` / `smallpoly.c`, symbols without the pqcrystals prefix),
+#: which the reference list cannot name -- those are the most key-dependent code in signing.
+_SP = 256 * 2         # smallpoly / smallhalfpoly (int16[256])
+_ETA_PACKED = 96      # POLYETA_PACKEDBYTES (ML-DSA-44, eta = 2)
+_SIGN = "crypto_sign_signature_ctx"
+
+
+def _r(sym, args, out=0, caller=None, nth=-1, label=None):
+    """A target on a raw symbol (no pqcrystals prefix), optionally caller-filtered."""
+    return Target(func=sym, nth=nth, args=args, out=out, caller=caller, label=label or sym)
+
+
+_D = "pqcrystals_dilithium_"
+_SMALL_INPLACE = (("in", _SP), "scalar")                  # (int16 a[N], const int32 *zetas)
+_SMALL_MUL = (("out", _SP), ("in", _SP), ("in", _SP), ("in", _SP))   # (c, s, ĉ, ĉ')
+
+M4F_TARGETS = {
+    # -- the 32-bit NTT/INTT workers, split by operand role (caller) --------------------
+    "ntt_c":    _r(_D + "ntt", (("in", _P),), caller=_SIGN, label="ntt (NTT(c), public)"),
+    "ntt_y":    _r(_D + "ntt", (("in", _P),), caller=_D + "polyvecl_ntt",
+                   label="ntt (NTT(y), secret nonce)"),
+    "ntt_t0":   _r(_D + "ntt", (("in", _P),), caller=_D + "polyveck_ntt",
+                   label="ntt (NTT(t0), key)"),
+    "invntt_ct0": _r(_D + "invntt_tomont", (("in", _P),), caller=_SIGN,
+                     label="invntt_tomont (c*t0)"),
+    "invntt_w": _r(_D + "invntt_tomont", (("in", _P),), caller=_D + "polyveck_invntt_tomont",
+                   label="invntt_tomont (w = A*y)"),
+    # -- m4f small-NTT path: the c*s1 / c*s2 products ------------------------------------
+    "small_polyeta_unpack": _r("small_polyeta_unpack", (("out", _SP), ("in", _ETA_PACKED)),
+                               nth=1, label="small_polyeta_unpack (s1[0])"),
+    "polyvecl_small_ntt": _r("polyvecl_small_ntt", (("in", 4 * _SP),), label="polyvecl_small_ntt (s1)"),
+    "polyveck_small_ntt": _r("polyveck_small_ntt", (("in", 4 * _SP),), label="polyveck_small_ntt (s2)"),
+    "poly_small_ntt_precomp": _r("poly_small_ntt_precomp", (("out", _SP), ("out", _SP), ("in", _P)),
+                                 label="poly_small_ntt_precomp (c, public)"),
+    "small_ntt_s1": _r("small_ntt_asm_769", _SMALL_INPLACE, caller="polyvecl_small_ntt",
+                       label="small_ntt_asm (NTT(s1))"),
+    "small_ntt_s2": _r("small_ntt_asm_769", _SMALL_INPLACE, caller="polyveck_small_ntt",
+                       label="small_ntt_asm (NTT(s2))"),
+    "small_ntt_c":  _r("small_ntt_asm_769", _SMALL_INPLACE, caller="poly_small_ntt_precomp",
+                       label="small_ntt_asm (NTT(c), public)"),
+    "small_mul_cs1": _r("small_asymmetric_mul_asm_769", _SMALL_MUL,
+                        caller="polyvecl_small_basemul_invntt", label="small_asymmetric_mul (c*s1)"),
+    "small_mul_cs2": _r("small_asymmetric_mul_asm_769", _SMALL_MUL,
+                        caller="poly_small_basemul_invntt", label="small_asymmetric_mul (c*s2)"),
+    "small_invntt_cs1": _r("small_invntt_asm_769", _SMALL_INPLACE,
+                           caller="polyvecl_small_basemul_invntt", label="small_invntt_asm (c*s1)"),
+    "small_invntt_cs2": _r("small_invntt_asm_769", _SMALL_INPLACE,
+                           caller="poly_small_basemul_invntt", label="small_invntt_asm (c*s2)"),
+    "polyvecl_small_basemul_invntt": _r(
+        "polyvecl_small_basemul_invntt", (("out", _V), ("in", _SP), ("in", _SP), ("in", 4 * _SP)),
+        label="polyvecl_small_basemul_invntt (c*s1)"),
+    "poly_small_basemul_invntt": _r(
+        "poly_small_basemul_invntt", (("out", _P), ("in", _SP), ("in", _SP), ("in", _SP)),
+        label="poly_small_basemul_invntt (c*s2)"),
+}
+
+#: reference (LLVM-study) function -> the m4f function(s) that actually do its job in signing
+M4F_EQUIVALENT = {
+    "polyvecl_pointwise_poly_montgomery": "polyvecl_small_basemul_invntt",   # c*s1
+    "polyveck_pointwise_poly_montgomery": "poly_small_basemul_invntt",       # c*s2 (per poly, in the K loop)
+    "poly_pointwise_montgomery": "small_asymmetric_mul_asm_769",
+    "polyvecl_invntt_tomont": "small_invntt_asm_769",
+}
+
 #: LLVM-study functions NOT reachable by signing-time funcskip (sampled in keygen only).
 KEYGEN_ONLY = {"poly_uniform_eta", "polyvecl_uniform_eta", "polyveck_uniform_eta",
                "polyveck_shiftl"}

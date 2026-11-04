@@ -650,6 +650,20 @@ def test_detect_reuses_dump():
         pass
 
 
+def test_capture_caller_filter_selects_operand():
+    """`Target.caller` picks WHICH call of a multiply-called function is captured:
+    `ntt` from the signing body is NTT(c) (the last call, = the unfiltered target),
+    from `polyvecl_ntt` it is NTT(y) -- a different operand."""
+    import tempfile
+    from ucpqc import captures
+    need(DILITHIUM)
+    out = tempfile.mkdtemp(prefix="ucpqc-caller-")
+    captures.capture_all(DILITHIUM, out, targets=["ntt", "ntt_c", "ntt_y"], n=1, jobs=1)
+    cap = {t: captures.load_captures(out, t)[1]["A"][0] for t in ("ntt", "ntt_c", "ntt_y")}
+    assert cap["ntt"].inputs == cap["ntt_c"].inputs, "unfiltered last ntt call is NTT(c)"
+    assert cap["ntt_y"].inputs != cap["ntt_c"].inputs, "caller filter selects another operand"
+
+
 def test_funcskip_dump_matches_live():
     """`funcskip --dump` + offline `assess_funcskip_from_dump` reproduces the live
     funcskip verdict: every scored (survivor) skip site agrees on metric/p/status.
