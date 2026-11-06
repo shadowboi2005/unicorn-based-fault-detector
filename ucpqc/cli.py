@@ -317,7 +317,11 @@ def cmd_detect(args):
 def cmd_phi(args):
     """Per-position phi_IF: the key-dependent-ineffective (SIFA-candidate) detector."""
     from . import phi as phimod
-    m, scheme = _machine(args)
+    # Do NOT pre-stub the RNG here: per_position_phi installs its own single "seed"
+    # stub, which capture() resets per signing.  A pre-stub would leave an earlier
+    # stream governing the guest RNG while capture resets a different one -> the
+    # signing region goes nondeterministic and effectiveness is spurious everywhere.
+    m, scheme = _machine(args, stub_rng=False)
     profile = _profile(args, scheme)
     result = phimod.per_position_phi(scheme, profile, sites=args.sites, k=args.k,
                                      budget=args.budget, q=args.fdr)
