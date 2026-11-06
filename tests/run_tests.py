@@ -601,6 +601,8 @@ def test_ineffective_tracker():
     t2.update(1, np.zeros((n_bg, 1, n_pos), bool))
     t2.update(2, np.zeros((n_bg, 1, n_pos), bool))
     assert t2.hit() is None, "all-effective -> no witness"
+    # no backgrounds -> the 'forall p' is vacuous and must NOT spuriously hit
+    assert IneffectiveTracker(n_pos, 0).hit() is None, "empty background set is guarded"
 
 
 def test_constructive_phi_runs():

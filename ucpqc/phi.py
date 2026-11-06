@@ -82,6 +82,8 @@ class IneffectiveTracker:
 
     def hit(self):
         """None, or (pos, [(s_ineffective, s_effective) per background])."""
+        if self.has_inef.shape[0] == 0:          # no backgrounds -> 'forall p' is vacuous
+            return None
         ok = (self.has_inef & self.has_eff).all(axis=0)
         pos = np.flatnonzero(ok)
         if pos.size == 0:

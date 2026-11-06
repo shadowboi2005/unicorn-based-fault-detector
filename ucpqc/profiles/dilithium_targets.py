@@ -53,8 +53,9 @@ TARGETS = {
     "polyvecl_uniform_gamma1":
         _t("polyvecl_uniform_gamma1", (("out", _V), ("in", _CRH), "scalar")),
     # -- polyveck wrappers (K-iteration loop bodies) -----------------------------------
-    "polyveck_add":        _t("polyveck_add", (("out", _V), ("in", _V), ("in", _V)),
-                              secret=(1, "q")),   # arg1 ("u") is the secret-dependent input
+    "polyveck_add":        _t("polyveck_add", (("out", _V), ("in", _V), ("in", _V))),
+    #   (no `secret=`: polyveck_add is a verify-path function, not reached during signing,
+    #    so the signing-driven phi sweep cannot capture it)
     "polyveck_sub":        _t("polyveck_sub", (("out", _V), ("in", _V), ("in", _V))),
     "polyveck_caddq":      _t("polyveck_caddq", (("in", _V),), out=0),
     "polyveck_decompose":  _t("polyveck_decompose", (("out", _V), ("out", _V), ("in", _V)),
