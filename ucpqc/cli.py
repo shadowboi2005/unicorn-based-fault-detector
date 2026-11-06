@@ -315,26 +315,28 @@ def cmd_detect(args):
 
 
 def cmd_phi(args):
-    """Per-position phi_IF: the key-dependent-ineffective (SIFA-candidate) detector."""
+    """Constructive phi_IF: the key-dependent-ineffective (SIFA-candidate) detector.
+
+    Isolates one function, injects a chosen secret coefficient over its domain, and asks
+    whether skipping an interior call is ineffective for some secret values and effective
+    for others (∀ public background), at some output position."""
     from . import phi as phimod
-    # Do NOT pre-stub the RNG here: per_position_phi installs its own single "seed"
-    # stub, which capture() resets per signing.  A pre-stub would leave an earlier
-    # stream governing the guest RNG while capture resets a different one -> the
-    # signing region goes nondeterministic and effectiveness is spurious everywhere.
+    # Do NOT pre-stub the RNG: the capture path installs the single governing stub, and
+    # the seed-restored snapshot/restore keeps correct vs faulted on identical (p, r).
     m, scheme = _machine(args, stub_rng=False)
     profile = _profile(args, scheme)
-    result = phimod.per_position_phi(scheme, profile, sites=args.sites, k=args.k,
-                                     budget=args.budget, q=args.fdr)
-    print(f"{result.scheme}  per-position phi_IF  K={result.k}  FDR q={result.q:g}")
-    head = f"  {'addr':>8}  {'callee (bl)':<44} {'witnesses':>9} {'/split':>7}  attribution"
+    result = phimod.per_position_phi(scheme, profile, args.target, secret_pos=args.secret_pos,
+                                     k=args.k, domain_cap=args.domain_cap, budget=args.budget,
+                                     sites=args.site)
+    print(f"{result.scheme}  constructive phi_IF  target={result.target}  "
+          f"secret-coeff={result.secret_pos}  backgrounds={result.k}  values={result.n_values}")
+    head = f"  {'addr':>8}  {'callee (bl)':<40}  detected  detail"
     print(head)
     print("  " + "-" * (len(head) - 2))
     for s in result.sites:
-        addr = f"{s.pc:#06x}"
-        print(f"  {addr:>8}  {s.label[:44]:<44} {len(s.witnesses):>9} {s.n_split:>7}  "
-              f"{s.attribution}")
-    flagged = result.witnesses()
-    print(f"  -> {len(flagged)} site(s) with key-dependent-ineffective witness positions "
+        print(f"  {s.pc:#06x}  {s.label[:40]:<40}  {'YES' if s.detected else ' no':>8}  {s.note}")
+    hits = result.detections()
+    print(f"  -> {len(hits)} site(s) with a key-dependent-ineffective witness "
           f"(candidate SIFA surface; not a proven exploit)")
     return 0
 
@@ -636,20 +638,26 @@ def _add_funcskip_parser(sub):
 
 
 def _add_phi_parser(sub):
-    p = sub.add_parser("phi", help="per-position phi_IF: the key-dependent-ineffective "
-                       "(SIFA-candidate) detector -- skip each signing-body callee and test, "
-                       "per output byte, whether ineffectiveness is secret-dependent")
+    p = sub.add_parser("phi", help="constructive phi_IF: the key-dependent-ineffective "
+                       "(SIFA-candidate) detector -- isolate a target function, inject a "
+                       "chosen secret coefficient over its domain, and test per output "
+                       "position whether skipping an interior call is secret-dependently "
+                       "ineffective (forall public background)")
     _add_common_elf_args(p)
-    p.add_argument("--k", type=int, default=32,
-                   help="keys (secret arm) / messages (input control) to sample (default 32)")
-    p.add_argument("--sites", default=None,
-                   help="comma-separated substrings restricting the signing-body callees "
-                        "to score (default: every direct callee)")
-    p.add_argument("--budget", type=int, default=40_000_000,
-                   help="max instructions per skip-replay (default 4e7)")
-    p.add_argument("--fdr", type=float, default=0.05,
-                   help="BH-FDR level across output positions (default 0.05; raise toward "
-                        "recall)")
+    p.add_argument("--target", required=True,
+                   help="function-level target to sweep (must carry a `secret` annotation), "
+                        "e.g. polyveck_decompose / polyvecl_add / polyveck_add")
+    p.add_argument("--secret-pos", type=int, default=0, dest="secret_pos",
+                   help="which int32 coefficient of the secret arg to sweep (default 0)")
+    p.add_argument("--k", type=int, default=6,
+                   help="public backgrounds = distinct messages (the 'forall p', default 6)")
+    p.add_argument("--domain-cap", type=int, default=64, dest="domain_cap",
+                   help="max secret values swept across the coefficient domain (default 64)")
+    p.add_argument("--site", default=None,
+                   help="comma-separated substrings restricting the interior bl fault sites "
+                        "(default: every interior call of the target)")
+    p.add_argument("--budget", type=int, default=5_000_000,
+                   help="max instructions per isolated replay (default 5e6)")
     p.add_argument("--profile", help="force an analysis profile (default: auto from scheme)")
     p.set_defaults(handler=cmd_phi)
 
