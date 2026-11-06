@@ -593,7 +593,7 @@ class Machine:
             self._alloc_ptr,
             bytes(self.peripherals.uart_out),
             dict(self.peripherals.regs),
-            [(s, s.pos) for s in self._streams],
+            [(s, s.seed, s.pos) for s in self._streams],
         )
 
     def restore(self, snap):
@@ -604,8 +604,11 @@ class Machine:
         self._alloc_ptr = snap._alloc
         self.peripherals.uart_out[:] = snap._uart
         self.peripherals.regs = dict(snap._periph)
-        for stream, pos in snap._streams:
-            stream.pos = pos
+        for stream, seed, pos in snap._streams:
+            stream.seed = seed            # restore seed too: a snapshot/replay across
+            stream.pos = pos              # a reseed (e.g. per-key signing) must be
+            #                               deterministic, or golden vs faulted diverge
+            #                               on RNG alone (randomized signing)
         self.exited = False
         self.exit_code = None
         self._booted = True
