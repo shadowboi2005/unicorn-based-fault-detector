@@ -65,6 +65,10 @@ class Target:
     out: object = "ret"
     label: str = ""
     caller: str = None
+    secret: tuple = None           # (arg_index, domain_name): which ("in") arg carries the
+    #                                secret, and its per-coefficient domain (see
+    #                                MLDSAProfile.domain_values). Used by the constructive
+    #                                ineffective sweep (ucpqc.phi) to inject chosen secrets.
 
     def out_size(self):
         return 0 if self.out == "ret" else int(self.args[self.out][1])
@@ -243,13 +247,18 @@ class Recorder:
 # replay one capture under an optional fault
 # --------------------------------------------------------------------------
 def replay(machine, target, capture, spec=None, backend="snapshot",
-           budget=5_000_000):
+           budget=5_000_000, overrides=None):
     """Replay `capture` under optional FaultSpec `spec`.  Returns the faulted
-    output (bytes or int) or None if the replay crashed/hung."""
+    output (bytes or int) or None if the replay crashed/hung.
+
+    `overrides` (``{arg_index: bytes}``) plants chosen bytes into input buffers before
+    the replay runs -- the seam the constructive ineffective sweep uses to inject a
+    chosen secret coefficient into the secret-arg buffer, with everything else held at
+    the captured (public) state."""
     if backend == "snapshot":
-        return _replay_snapshot(machine, target, capture, spec, budget)
+        return _replay_snapshot(machine, target, capture, spec, budget, overrides)
     if backend == "call":
-        return _replay_call(machine, target, capture, spec, budget)
+        return _replay_call(machine, target, capture, spec, budget, overrides)
     raise ValueError(f"unknown backend {backend!r}")
 
 
@@ -259,10 +268,13 @@ def _read_out(machine, target, out_ptr, ret_val):
     return machine.read(out_ptr, target.out_size())
 
 
-def _replay_snapshot(machine, target, cap, spec, budget):
+def _replay_snapshot(machine, target, cap, spec, budget, overrides=None):
     if cap.snap is None:
         raise ValueError("snapshot backend needs Recorder(snapshot=True)")
     machine.restore(cap.snap)
+    if overrides:                             # plant chosen input bytes at their captured addr
+        for arg_i, data in overrides.items():
+            machine.write(cap.regs[f"r{arg_i}"], data)
     inj = Injector(machine, spec) if spec else None
     try:
         machine._emu_start(cap.entry | 1, cap.ret, count=budget)
@@ -275,7 +287,7 @@ def _replay_snapshot(machine, target, cap, spec, budget):
     return _read_out(machine, target, cap.out_ptr, ret_val)
 
 
-def _relocate_args(machine, target, cap):
+def _relocate_args(machine, target, cap, overrides=None):
     """Rebuild the captured call's arguments in fresh scratch and return
     ``(args, out_addr)`` (out_addr is None for a return-value target).
 
@@ -283,7 +295,7 @@ def _relocate_args(machine, target, cap):
     is relocated -- but aliasing is PRESERVED: two args that shared a pointer in the
     capture (an in-place op like z = z + y, where the out buffer is also an input)
     share the relocated buffer too, or a skipped write would read the wrong (fresh)
-    buffer."""
+    buffer.  `overrides` ({arg_index: bytes}) replaces an input's captured bytes."""
     args = []
     relocated = {}                          # captured pointer -> fresh buffer
     for i, arg_spec in enumerate(target.args[:4]):
@@ -296,18 +308,18 @@ def _relocate_args(machine, target, cap):
             buf = machine.alloc(arg_spec[1])
             relocated[captured_ptr] = buf
         if arg_spec[0] == "in":
-            machine.write(buf, cap.inputs[i])
+            machine.write(buf, (overrides or {}).get(i, cap.inputs[i]))
         args.append(buf)
     out_addr = relocated.get(cap.regs[f"r{target.out}"]) if target.out != "ret" else None
     return args, out_addr
 
 
-def _replay_call(machine, target, cap, spec, budget):
+def _replay_call(machine, target, cap, spec, budget, overrides=None):
     if target.func is None:
         raise ValueError("call backend needs a function target, not a region")
     mark = machine.scratch_mark()     # reclaim scratch after this trial
     try:
-        args, out_addr = _relocate_args(machine, target, cap)
+        args, out_addr = _relocate_args(machine, target, cap, overrides)
         inj = Injector(machine, spec) if spec else None
         try:
             ret_val = machine.call(target.func, args, max_instructions=budget)

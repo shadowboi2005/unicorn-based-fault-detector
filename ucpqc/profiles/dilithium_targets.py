@@ -18,9 +18,9 @@ _MAT = 4 * _V         # matrix[K] of polyvecl
 _SEED, _CRH, _CTILDE = 32, 64, 32
 
 
-def _t(sym, args, out=0, label=None):
+def _t(sym, args, out=0, label=None, secret=None):
     return Target(func=f"pqcrystals_dilithium_{sym}", nth=-1, args=args, out=out,
-                  label=label or sym)
+                  label=label or sym, secret=secret)
 
 
 #: funcskip targets reachable during SIGNING (the funcskip capture path), keyed by the
@@ -40,7 +40,8 @@ TARGETS = {
     "ntt":                 _t("ntt", (("in", _P),), out=0),
     "invntt_tomont":       _t("invntt_tomont", (("in", _P),), out=0),
     # -- polyvecl wrappers (L-iteration loop bodies) -----------------------------------
-    "polyvecl_add":        _t("polyvecl_add", (("out", _V), ("in", _V), ("in", _V))),
+    "polyvecl_add":        _t("polyvecl_add", (("out", _V), ("in", _V), ("in", _V)),
+                              secret=(1, "q")),   # z = z + y: arg1 is the secret c*s1 term
     "polyvecl_ntt":        _t("polyvecl_ntt", (("in", _V),), out=0),
     "polyvecl_invntt_tomont": _t("polyvecl_invntt_tomont", (("in", _V),), out=0),
     "polyvecl_reduce":     _t("polyvecl_reduce", (("in", _V),), out=0),
@@ -52,11 +53,13 @@ TARGETS = {
     "polyvecl_uniform_gamma1":
         _t("polyvecl_uniform_gamma1", (("out", _V), ("in", _CRH), "scalar")),
     # -- polyveck wrappers (K-iteration loop bodies) -----------------------------------
-    "polyveck_add":        _t("polyveck_add", (("out", _V), ("in", _V), ("in", _V))),
+    "polyveck_add":        _t("polyveck_add", (("out", _V), ("in", _V), ("in", _V)),
+                              secret=(1, "q")),   # arg1 ("u") is the secret-dependent input
     "polyveck_sub":        _t("polyveck_sub", (("out", _V), ("in", _V), ("in", _V))),
     "polyveck_caddq":      _t("polyveck_caddq", (("in", _V),), out=0),
     "polyveck_decompose":  _t("polyveck_decompose", (("out", _V), ("out", _V), ("in", _V)),
-                              out=1, label="polyveck_decompose (v0/r0)"),
+                              out=1, label="polyveck_decompose (v0/r0)",
+                              secret=(2, "q")),   # arg2 (input w) is the secret-dependent input
     "polyveck_make_hint":  _t("polyveck_make_hint", (("out", _V), ("in", _V), ("in", _V)), out=0),
     "polyveck_reduce":     _t("polyveck_reduce", (("in", _V),), out=0),
     "polyveck_ntt":        _t("polyveck_ntt", (("in", _V),), out=0),

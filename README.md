@@ -57,7 +57,7 @@ python -m ucpqc funcskip  fw.elf --target polyvecl_add    # intra-function skip 
 python -m ucpqc capture   fw.elf --n 40 --out captures    # one signing pass -> reusable cache
 python -m ucpqc funcskip  fw.elf --target poly_add --captures captures --dumpdir dumps  # replay, no re-sign
 python -m ucpqc detect    dumps/poly_add_instrskip --detector per_coord    # re-score offline, no emulator
-python -m ucpqc phi       fw.elf --sites polyvecl_add,poly_challenge        # per-position phi_IF (ineffective)
+python -m ucpqc phi       fw.elf --target polyveck_decompose                # constructive phi_IF (ineffective)
 python -m ucpqc build     crypto_kem/ml-kem-768/m4fspeed
 python -m ucpqc schemes   dilithium         # what is available in the pqm4 tree
 ```
@@ -84,11 +84,14 @@ render a bar chart).
 **Two detectors (instruction-skip scope).** The platform keeps exactly two,
 one per leak axis (see [`report/detector_inventory.md`](report/detector_inventory.md)):
 `per_coord` (the correction/output-leak axis, used by `sweep`/`funcskip`) and the
-per-position **`phi`** detector (the key-dependent-ineffective / SIFA-candidate
-axis, its own subcommand).  The richer detectors that targeted fault models this
-platform does not run (two_key/subspace/structural/mmd/uniformity/spec_aware/
-differential and the old whole-output `sifa`) were removed and are restorable from
-git history.
+constructive **`phi`** detector (the key-dependent-ineffective / SIFA-candidate
+axis, its own subcommand).  `phi` isolates a target function, **injects a chosen
+secret coefficient** over its domain, and tests per output position whether skipping
+an interior call is ineffective for some secret values and effective for others (∀
+public background) — the constructive oracle of the sibling QEMU-test framework.  The
+richer detectors that targeted fault models this platform does not run (two_key/
+subspace/structural/mmd/uniformity/spec_aware/differential and the old whole-output
+`sifa`) were removed and are restorable from git history.
 
 **Calibrated verdicts.** A LEAK is not a hand-tuned cutoff: each `per_coord` site's
 max‑|t| becomes a **per-site p-value** (the exact Bonferroni TVLA tail), and a
@@ -136,7 +139,7 @@ transformed = struct.unpack("<256i", m.read(poly, 1024))
 | `FaultCampaign` | sweep of fault models, classified against a golden run | one run per trial |
 | `assess.sweep_sites` | whole-call leak sweep of the operation loop (mode `sweep`) | one op per trial |
 | `assess.sweep_function` | intra-function instruction-skip sweep via capture-replay (mode `funcskip`) | one function per trial |
-| `phi.per_position_phi` | per-position key-dependent-ineffective detector (SIFA candidates) | K keygens × signings |
+| `phi.per_position_phi` | constructive key-dependent-ineffective detector: isolate a function, inject chosen secrets, sweep the domain (SIFA candidates) | domain × backgrounds × 2 replays |
 | `detectors` | `per_coord` TVLA (matched filter + `tvla_max`) + BH/Holm corrections | — |
 
 Faults are a `FaultSpec` (what) plus a trigger (when): `at=` a global
@@ -229,7 +232,7 @@ function (base-class default) — override only for curated/filtered sites.
 | detector | what the profile must add | example |
 |---|---|---|
 | `per_coord` (`sweep`/`funcskip`) | `challenge`, `response_from_*`, `feature` (a real-valued, ideally leak-aligned feature — e.g. Dilithium's matched filter) | `MLDSAProfile.feature` |
-| `phi` (per-position phi_IF) | nothing required to *locate* witnesses; `secret_coeffs(sk)` optionally attributes a flagged position to a secret coefficient | `MLDSAProfile.secret_coeffs` (s1) |
+| `phi` (constructive phi_IF) | a `Target.secret=(arg_index, domain)` annotation (which input arg is the secret + its coefficient domain) and `domain_values`/`domain_bounds` for the sweep | `dilithium_targets` secret annotations, `MLDSAProfile.domain_values` |
 | `funcskip` mode | `targets()` / `default_target` (a `replay.Target`: function, arg layout, output) | `MLDSAProfile.targets` |
 
 `challenge`/`response_from_*`/`feature` are the minimum to run a `per_coord`
@@ -302,7 +305,7 @@ Rough speeds on this machine: 14 MIPS unhooked (a full ML-DSA-44 signature in
 - **Fault-effect, not physical leakage.** The detectors measure whether a *fault*
   makes the output depend on the secret; they are noise-free and idealised — enough
   to answer *whether* and *where* a fault leaks, not how many real traces or faults
-  an attack needs. A per-position `phi` witness **locates a SIFA candidate; it is
+  an attack needs. A `phi` witness **locates a SIFA candidate; it is
   not a proven exploit.** (Side-channel leakage-trace simulation lives on the
   `has-leakage` branch, not here.)
 - **No interrupts.** SysTick is modelled as a counter but its interrupt is
@@ -323,7 +326,7 @@ isolated in one file — `ucpqc/profiles/mldsa.py`** (plus the demo scripts unde
 | `tracing`, `faults`, `replay` | general — operate on instructions/registers/memory/buffers |
 | `assess`, `report`, `cli` | general — the mode engine and reporting, written against the profile interface |
 | `scheme` | crypto-API-general — auto-detects SIGN/KEM entry points and sizes (ML-DSA, ML-KEM, Falcon, SPHINCS+); not one specific scheme |
-| `detectors`, `phi` | general — `tvla_t`/`tvla_max`, `bh_fdr`/`holm_bonferroni`, and the per-position phi_IF engine take plain feature matrices / any bound scheme |
+| `detectors`, `phi` | general — `tvla_t`/`tvla_max`, `bh_fdr`/`holm_bonferroni`, and the constructive phi_IF engine (isolate + inject + sweep) work on any profile with a `secret`-annotated target |
 | `detectors.matched_filter` | lattice-FS-specific — negacyclic correlation of a sparse ±1 challenge against response polynomials (the Dilithium *family*, not KEMs/hash-sigs) |
 | **`profiles/mldsa.py`** | **Dilithium-specific — everything below** |
 
@@ -358,8 +361,8 @@ supply is exactly this scheme-specific surface, and everything else is reused.
 must write per scheme         auto / optional (defaulted)      reused unchanged (general)
 ─────────────────────         ───────────────────────────      ──────────────────────────
 patterns  (glob)              fault_sites() (disassembly)      machine, elfimage, platform,
-challenge()                   secret_coeffs() (phi              tracing, faults, replay,
-response_from_signature()       attribution; else by index)    assess (engine), report, cli,
+challenge()                   Target.secret + domain_values     tracing, faults, replay,
+response_from_signature()       (phi sweep; else per_coord only) assess (engine), report, cli,
 response_from_output()        targets() (probe_target.py,      scheme (API detection),
 feature()      + constants      opt-in; else hand-written)     detectors, phi (except
                               setup(), artifact_len, op          matched_filter), profiles/__init__
@@ -378,7 +381,7 @@ ucpqc/
   replay.py     capture a function's I/O, replay it in isolation under faults
   detectors.py  per_coord TVLA (matched filter + tvla_max) + BH/Holm corrections
   assess.py     the sweep/funcskip mode engine (scheme-agnostic)
-  phi.py        per-position phi_IF: key-dependent-ineffective (SIFA-candidate) detector
+  phi.py        constructive phi_IF: chosen-secret-injection ineffective (SIFA-candidate) detector
   report.py     console table + bar-chart reporting for assessments
   profiles/     per-scheme analysis knowledge (AnalysisProfile; mldsa.py, mayo.py)
   firmware.py   pqm4 builds and manifest generation

@@ -1,207 +1,226 @@
-"""Per-position phi_IF -- the key-dependent-ineffective (SIFA-candidate) detector.
+"""phi_IF -- the key-dependent-ineffective (SIFA-candidate) detector, constructive.
 
-This is the `ineffective` axis of the platform, promoted from the LLVM-gap experiment
-(Arm B; see `report/llvm_gap_experiment.md`).  It replaces the old whole-output phi_IF
-(`sifa` / `candidates._phi_counts`), which averaged over two random keys and the whole
-released signature and so missed leaks that live in individual (secret coefficient ->
-output position) relations.
+This replicates the QEMU-test `ineffective` oracle
+(`QEMU-test/dist_tests/dilithium/early_stop_sweep_unicorn.py` + `common/ineffective.py`)
+inside ucpqc, instead of the earlier *sampling* approach (which, correctly controlled,
+found nothing because random keys never hit the chosen secret values a witness needs).
 
-The question it asks, for each fault site, is the LLVM study's `ineffective` oracle:
-"is there a secret making the skip a NO-OP and another making it EFFECTIVE, at this one
-output POSITION?"  We answer it by SAMPLING many keys instead of constructing secrets
-(no host-side secret packer exists), with an input-variation control:
+For one fault site (an interior `bl` callee of a target function F), the oracle asks the
+LLVM/QEMU `ineffective` question:
 
-  * SECRET arm  -- K independent keygens all signing the SAME message+RNG (only sk
-    varies); skip the site; record per-signature-byte effectiveness (faulted != that
-    key's own golden);
-  * INPUT control -- ONE key signing K different messages (secret fixed, background
-    varies);
-  * a byte POSITION is a phi_IF WITNESS if effectiveness is key-split there (some keys
-    ineffective, some effective) significantly MORE under secret variation than under
-    input variation (one-sided Fisher per position, BH-FDR at level `q`).
+    forall public background p : exists s1,s2 :
+        skipping the call is a NO-OP for secret value s1 (correct == faulted) and
+        OUTPUT-CHANGING for s2, at some output position
 
-Operating point: tuned for RECALL (a candidate locator favours false positives over
-false negatives) -- a loose default `q`, a ranked witness list, and the input control to
-keep "secret-dependent" apart from "merely input-dependent".
+answered **constructively** -- by *injecting a chosen secret coefficient value* into F's
+secret-input buffer and sweeping it over the coefficient's domain, with the public
+background and RNG held fixed across the correct vs faulted run:
 
-Scope / caveats:
-  * sampling has a false-negative floor the LLVM tool's constructive SMT search does not:
-    a leak triggered by a tiny fraction of secrets can be missed at small K -- raise K.
-  * a per-position `ineffective` witness LOCATES a SIFA candidate; it is NOT a proven
-    exploit.
-  * attribution of a position to a secret coefficient needs `profile.secret_coeffs`;
-    without it (e.g. MAYO today) positions are reported by index.
+  * isolate F via capture-and-replay (`replay.Recorder`/`replay`, snapshot backend);
+  * hold the public inputs + RNG fixed = the captured background `p_k` (the seed-restored
+    `Machine.snapshot/restore` keeps correct and faulted on identical `(p, r)`);
+  * sweep the secret value `sval` over `profile.domain_values(domain)` (0 first + spread),
+    writing it into coefficient `secret_pos` of F's secret arg via `replay(overrides=...)`;
+  * correct = replay with no fault; faulted = replay with a persistent SKIP at the `bl`;
+  * per output word, record eq = (correct == faulted);
+  * `IneffectiveTracker` declares a hit at an output position where, for EVERY background,
+    both an ineffective `sval` and an effective `sval` were seen (ported from QEMU).
+
+The fault is applied at **runtime** (`Injector` SKIP of the interior `bl`), so unlike
+QEMU-test we need no prebuilt faulty ELF.
+
+Caveats:
+  * a per-position `ineffective` witness LOCATES a SIFA candidate; it is NOT a proven exploit.
+  * v1 covers function-level targets whose secret arg is an unpacked int32 coefficient buffer
+    (annotated `Target.secret`); `signature_internal`/packed-`sk` is out of scope.
+  * run on a build whose target symbols exist un-inlined (the m4f/clean ref-style builds).
 """
 
+import struct
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import assess, detectors
+from . import assess
 from .faults import SKIP, FaultSpec
-from .profiles import _scan_calls, signing_body
-from .replay import Injector
+from .profiles import _scan_calls
+from .replay import replay
 
-DEFAULT_K = 32
-DEFAULT_BUDGET = 40_000_000
-DEFAULT_Q = 0.05
+DEFAULT_K = 6               # public backgrounds (distinct messages)
+DEFAULT_DOMAIN_CAP = 64     # max swept secret values per coefficient
+DEFAULT_BUDGET = 5_000_000  # max instructions per isolated replay
 
 
+# --------------------------------------------------------------------------
+# ineffective verdict -- ported from QEMU-test dist_tests/common/ineffective.py
+# --------------------------------------------------------------------------
+class IneffectiveTracker:
+    """Incremental ineffective oracle: feed one swept secret value at a time.
+
+    `eq[k][j][pos]` = (correct == faulted) for public background k, ephemeral draw j
+    (J = 1 here -- these targets consume no RNG), output position pos.  A hit is a
+    position where, for EVERY background, some swept value was ineffective on all J draws
+    and some other was effective on all J draws."""
+
+    def __init__(self, n_pos, n_bg):
+        shape = (n_bg, n_pos)
+        self.has_inef = np.zeros(shape, dtype=bool)
+        self.has_eff = np.zeros(shape, dtype=bool)
+        self.val_inef = np.zeros(shape, dtype=np.int64)
+        self.val_eff = np.zeros(shape, dtype=np.int64)
+
+    def update(self, sv, eq):
+        """eq: bool array (n_bg, n_eph, n_pos) for secret value `sv`."""
+        eq = np.asarray(eq, dtype=bool)
+        inef, eff = eq.all(axis=1), (~eq).all(axis=1)      # (n_bg, n_pos)
+        new = inef & ~self.has_inef
+        self.val_inef[new] = sv
+        self.has_inef |= inef
+        new = eff & ~self.has_eff
+        self.val_eff[new] = sv
+        self.has_eff |= eff
+
+    def hit(self):
+        """None, or (pos, [(s_ineffective, s_effective) per background])."""
+        ok = (self.has_inef & self.has_eff).all(axis=0)
+        pos = np.flatnonzero(ok)
+        if pos.size == 0:
+            return None
+        p = int(pos[0])
+        return p, [(int(self.val_inef[k, p]), int(self.val_eff[k, p]))
+                   for k in range(self.val_inef.shape[0])]
+
+
+# --------------------------------------------------------------------------
+# result model
+# --------------------------------------------------------------------------
 @dataclass
 class PhiSite:
     pc: int
     label: str
-    witnesses: list = field(default_factory=list)   # flagged byte positions (ranked)
-    n_split: int = 0                                 # key-split positions tested
-    attribution: str = ""                            # first witness -> secret coeff, if known
+    detected: bool = False
+    pos: int = -1                         # output position of the witness
+    witness: tuple = None                 # (s1_ineffective, s2_effective), first background
+    note: str = ""
 
 
 @dataclass
 class PhiResult:
     scheme: str
+    target: str
+    secret_pos: int
     k: int
-    q: float
+    n_values: int
     sites: list = field(default_factory=list)
 
-    def witnesses(self):
-        return [s for s in self.sites if s.witnesses]
+    def detections(self):
+        return [s for s in self.sites if s.detected]
 
 
-def _resolve_sites(machine, body, wanted):
-    """[(pc, label)] for the signing-body `bl` callees, optionally restricted to those
-    whose label contains one of the `wanted` substrings (first occurrence of each)."""
-    sites = []
-    for pc, _t, label in _scan_calls(machine, body):
-        if wanted is None:
-            if pc not in {s[0] for s in sites}:
-                sites.append((pc, label))
-        else:
-            for w in wanted:
-                if w in label and not any(w in s[1] for s in sites):
-                    sites.append((pc, label))
-    return sites
+# --------------------------------------------------------------------------
+# the constructive sweep
+# --------------------------------------------------------------------------
+def _splice_coeff(buf, pos, sval):
+    """Return `buf` with the int32 coefficient at index `pos` replaced by `sval`."""
+    ba = bytearray(buf)
+    ba[pos * 4:pos * 4 + 4] = struct.pack("<i", int(sval))
+    return bytes(ba)
 
 
-def per_position_phi(scheme, profile, sites=None, k=DEFAULT_K, budget=DEFAULT_BUDGET,
-                     q=DEFAULT_Q, sig_bytes=None, progress=None):
-    """Score per-position phi_IF for each fault site, returning a `PhiResult`.
+def _eq_words(correct, faulted, n):
+    """Per-output-word equality (bool[n]); a crash/None counts as effective (changed)."""
+    if correct is None or faulted is None:
+        return np.zeros(n, dtype=bool)
+    a = np.frombuffer(correct, dtype="<i4")[:n]
+    b = np.frombuffer(faulted, dtype="<i4")[:n]
+    if a.size < n or b.size < n:
+        return np.zeros(n, dtype=bool)
+    return a == b
 
-    `sites` -- comma/substring list (or list of substrings) restricting the signing-body
-    callees to score; None scores every direct callee.  `k` -- keys (secret arm) and
-    messages (input control).  `sig_bytes` -- released-artifact length (defaults to
-    `profile.artifact_len`).
-    """
+
+def _fault_sites(machine, func, wanted):
+    """Interior `bl` callees of `func` as [(pc, label)], deduped; optionally filtered to
+    labels containing one of the `wanted` substrings."""
+    seen, out = set(), []
+    for pc, _t, label in _scan_calls(machine, func):
+        if pc in seen:
+            continue
+        seen.add(pc)
+        if wanted and not any(w in label for w in wanted):
+            continue
+        out.append((pc, label))
+    return out
+
+
+def per_position_phi(scheme, profile, target_name, secret_pos=0, k=DEFAULT_K,
+                     domain_cap=DEFAULT_DOMAIN_CAP, budget=DEFAULT_BUDGET,
+                     sites=None, progress=None):
+    """Constructive ineffective sweep over target `target_name`.  Returns a `PhiResult`.
+
+    `secret_pos` -- which int32 coefficient of the secret arg to sweep (default 0).
+    `k` -- public backgrounds (distinct messages).  `sites` -- substrings restricting the
+    interior `bl` fault sites (default: all)."""
     if isinstance(sites, str):
         sites = [s.strip() for s in sites.split(",") if s.strip()]
-    sig_bytes = sig_bytes or profile.artifact_len
-    if not sig_bytes:
-        raise ValueError("per_position_phi needs a fixed artifact length "
-                         "(profile.artifact_len); pass sig_bytes= for a variant-agnostic "
-                         "profile")
     m = scheme.machine
-    profile.setup(m)
-    m.stub_cycle_counter()
-    stream = m.stub_randombytes(b"seed")
-    clean = m.snapshot()
-    sign_fn = scheme.binding.symbols["signature"]
-    entry = m.addr_of(sign_fn)
-    body = signing_body(m, sign_fn)
-    resolved = _resolve_sites(m, body, sites)
+    targets = profile.targets() if hasattr(profile, "targets") else {}
+    if target_name not in targets:
+        raise ValueError(f"unknown target {target_name!r}; known: {', '.join(sorted(targets))}")
+    target = targets[target_name]
+    if not target.secret:
+        raise ValueError(f"target {target_name!r} has no `secret` annotation (which arg "
+                         f"carries the secret + its domain); see dilithium_targets._t")
+    secret_arg, domain_name = target.secret
+    n_pos = target.out_size() // 4
+    if n_pos == 0:
+        raise ValueError(f"target {target_name!r} has a return-value output; the sweep needs "
+                         f"a buffer output to compare per position")
 
-    # K independent keys (+ their labelled secret coeffs, if the profile offers them)
-    keys, coeffs = [], []
-    for i in range(k):
-        sk = assess._keypair(scheme, f"key-{i:03d}".encode())[1]
-        keys.append(sk)
-        coeffs.append(profile.secret_coeffs(sk))
-    key_a = keys[0]
-    have_coeffs = all(c is not None for c in coeffs)
+    # Isolate F and capture K public backgrounds (one key, K distinct messages); the
+    # snapshot backend keeps each background's full (public + RNG) state for replay.
+    caps = assess._capture_funcskip(scheme, profile, target, "snapshot",
+                                    assess.DEFAULT_KEYS, k)["A"]
+    if len(caps) < 2:
+        raise ValueError(f"target {target_name!r} captured < 2 backgrounds (reached "
+                         f"{len(caps)}); not enough for the 'forall p' test")
+    values = profile.domain_values(domain_name, domain_cap)
 
-    def capture(sk, j):
-        """Snapshot the signing body at entry for secret `sk` signing message j."""
-        m.restore(clean)
-        stream.reset(f"nonce-{j}".encode())
-        box = {}
+    # Zero the output buffer before each replay (QEMU-test convention), so a skipped
+    # write leaves a clean 0 baseline and "ineffective" means the correct output is also 0
+    # (e.g. decompose(0)=0) -- a well-defined per-secret condition. Skip when the output
+    # buffer aliases the secret arg (in-place ops like z=z+y), where it cannot be zeroed
+    # without destroying the injected secret.
+    if target.out != "ret":
+        out_z_bytes = b"\x00" * target.out_size()
 
-        def on_entry(mm, addr, size):
-            if "snap" not in box:
-                box["snap"] = mm.snapshot()
-                box["ret"] = mm.reg("lr") & ~1
-                box["sig"] = mm.reg("r0")
-                mm.uc.emu_stop()
-        h = m.hook_code(on_entry, begin=entry, end=entry, precise=False)
-        try:
-            scheme.sign(assess.standard_messages(j + 1)[j], sk, max_instructions=budget * 2)
-        except Exception:
-            pass
-        finally:
-            m.unhook(h)
-        return box
-
-    def run(box, pc=None):
-        m.restore(box["snap"])
-        inj = Injector(m, FaultSpec(kind=SKIP, pc=pc, hit=0)) if pc is not None else None
-        try:
-            m._emu_start(entry | 1, box["ret"], count=budget)
-        except Exception:
-            return None
-        finally:
-            if inj:
-                inj.detach()
-        return bytes(m.uc.mem_read(box["sig"], sig_bytes))
-
-    sec_boxes = [capture(keys[i], 0) for i in range(k)]        # secret arm: fixed message
-    sec_gold = [run(b) for b in sec_boxes]
-    inp_boxes = [capture(key_a, j) for j in range(k)]          # input control: fixed key
-    inp_gold = [run(b) for b in inp_boxes]
-
-    def eff_matrix(boxes, golds, pc):
-        M = np.zeros((len(boxes), sig_bytes), bool)
-        for i, (box, g) in enumerate(zip(boxes, golds)):
-            f = run(box, pc)
-            if f is None or g is None:
-                M[i, :] = True                                 # crash/runaway == fully effective
-            else:
-                M[i, :] = np.frombuffer(f, np.uint8) != np.frombuffer(g, np.uint8)
-        return M
-
-    coeff_flat = (np.array([c.ravel() for c in coeffs]) if have_coeffs else None)
     out_sites = []
-    for pc, label in resolved:
-        site = _score_site(pc, label, eff_matrix(sec_boxes, sec_gold, pc),
-                           eff_matrix(inp_boxes, inp_gold, pc), coeff_flat, k, q)
+    for pc, label in _fault_sites(m, target.func, sites):
+        tracker = IneffectiveTracker(n_pos, len(caps))
+        for sval in values:
+            eq = np.zeros((len(caps), 1, n_pos), dtype=bool)
+            for bi, cap in enumerate(caps):
+                ov = {secret_arg: _splice_coeff(cap.inputs[secret_arg], secret_pos, sval)}
+                if (target.out != "ret"
+                        and cap.regs[f"r{target.out}"] != cap.regs[f"r{secret_arg}"]):
+                    ov[target.out] = out_z_bytes          # clean output baseline
+                correct = replay(m, target, cap, spec=None, backend="snapshot",
+                                 budget=budget, overrides=ov)
+                faulted = replay(m, target, cap, spec=FaultSpec(kind=SKIP, pc=pc, hit=0),
+                                 backend="snapshot", budget=budget, overrides=ov)
+                eq[bi, 0, :] = _eq_words(correct, faulted, n_pos)
+            tracker.update(sval, eq)
+        hit = tracker.hit()
+        site = PhiSite(pc, label)
+        if hit is not None:
+            pos, wit = hit
+            site.detected = True
+            site.pos = pos
+            site.witness = wit[0]
+            site.note = (f"out-pos {pos}: s1={wit[0][0]} ineffective, s2={wit[0][1]} effective "
+                         f"(secret coeff {secret_pos}, on all {len(caps)} backgrounds)")
+        else:
+            site.note = "no (ineffective, effective) pair on every background in range swept"
         out_sites.append(site)
         if progress:
             progress(site)
-    return PhiResult(scheme.name, k, q, out_sites)
-
-
-def _score_site(pc, label, m_sec, m_inp, coeff_flat, k, q):
-    """Per-position Fisher (secret-split vs input-split) + BH-FDR for one site."""
-    from scipy.stats import fisher_exact
-    sec_eff, inp_eff = m_sec.sum(0), m_inp.sum(0)
-    positions, pvals = [], []
-    for p in range(m_sec.shape[1]):
-        se, ie = int(sec_eff[p]), int(inp_eff[p])
-        if 0 < se < k:                                         # key-split here (the witness shape)
-            positions.append(p)
-            pvals.append(fisher_exact([[se, k - se], [ie, k - ie]], alternative="greater")[1])
-    keep = detectors.bh_fdr(np.array(pvals), q) if pvals else []
-    flagged = [p for p, ok in zip(positions, keep) if ok]
-    attribution = _attribute(flagged, m_sec, coeff_flat) if flagged else ""
-    return PhiSite(pc, label, flagged, len(positions), attribution)
-
-
-def _attribute(flagged, m_sec, coeff_flat):
-    """Attribute the first flagged position to the most-separating secret coefficient."""
-    if coeff_flat is None:
-        return f"pos {flagged[0]} (no secret_coeffs: index only)"
-    p0 = flagged[0]
-    eff = m_sec[:, p0]
-    if not eff.any() or not (~eff).any():
-        return f"pos {p0}"
-    diff = np.abs(coeff_flat[eff].mean(0) - coeff_flat[~eff].mean(0))
-    c = int(np.argmax(diff))                              # 256 coeffs per poly row
-    return (f"pos {p0}: coeff[{c // 256},{c % 256}] "
-            f"mean {coeff_flat[~eff][:, c].mean():.1f} (ineff) vs "
-            f"{coeff_flat[eff][:, c].mean():.1f} (eff)")
+    return PhiResult(scheme.name, target_name, secret_pos, len(caps), len(values), out_sites)

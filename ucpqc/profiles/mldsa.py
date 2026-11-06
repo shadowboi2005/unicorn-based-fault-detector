@@ -91,6 +91,28 @@ class MLDSAProfile(AnalysisProfile):
         """s1 (L x 256) for per-position phi_IF attribution -- see :func:`unpack_s1`."""
         return unpack_s1(sk)
 
+    # -- secret sweep domain (constructive ineffective oracle) --------------
+    def domain_bounds(self, name):
+        """Inclusive (lo, hi) a single coefficient of the named domain can take --
+        the per-coefficient value range the ineffective sweep injects over."""
+        return {"eta": (-ETA, ETA), "q": (0, Q - 1),
+                "gamma1": (-GAMMA1 + 1, GAMMA1), "challenge": (-1, 1),
+                }.get(name, (0, 255))
+
+    def domain_values(self, name, cap=64):
+        """At most `cap` chosen coefficient values across `name`'s domain, 0 first
+        (QEMU `domain_values` convention): the whole range if it fits, else 0 + an
+        evenly-spread set including the endpoints."""
+        lo, hi = self.domain_bounds(name)
+        if hi - lo + 1 <= cap:
+            vals = list(range(lo, hi + 1))
+        else:
+            step = (hi - lo) / (cap - 1)
+            vals = sorted({int(round(lo + k * step)) for k in range(cap)})
+        if lo <= 0 <= hi:
+            vals = [0] + [v for v in vals if v != 0]
+        return vals
+
     # -- funcskip targets ---------------------------------------------------
     def targets(self):
         """Named funcskip targets (short name -> replay.Target).  The curated few below
@@ -100,7 +122,9 @@ class MLDSAProfile(AnalysisProfile):
         pv = (("out", POLYVECL_BYTES), ("in", POLYVECL_BYTES), ("in", POLYVECL_BYTES))
         curated = {
             "polyvecl_add": Target(func="pqcrystals_dilithium_polyvecl_add",
-                                   nth=-1, args=pv, out=0, label="polyvecl_add (z=z+y)"),
+                                   nth=-1, args=pv, out=0, label="polyvecl_add (z=z+y)",
+                                   secret=(1, "q")),   # arg1 is the secret c*s1 term
+
             "polyvecl_reduce": Target(func="pqcrystals_dilithium_polyvecl_reduce",
                                       nth=-1, args=(("in", POLYVECL_BYTES),), out=0,
                                       label="polyvecl_reduce (control)"),

@@ -581,24 +581,46 @@ def test_funcskip_dumpdir_resolves():
     assert c["maxineff"] > 0, "ineffective fraction populated from the dump's golden outputs"
 
 
-def test_per_position_phi_runs():
-    """ucpqc.phi (per-position phi_IF, the ineffective axis) runs on the clean build and
-    returns well-formed ranked witnesses; when it flags, the position carries an s1
-    coefficient attribution via profile.secret_coeffs."""
+def test_ineffective_tracker():
+    """The ported ineffective verdict (phi.IneffectiveTracker): a hit needs, at one output
+    position, an ineffective AND an effective swept value on EVERY background; a position
+    that is always-effective (or always-ineffective) over the sweep does not hit."""
+    import numpy as np
+    from ucpqc.phi import IneffectiveTracker
+    n_bg, n_pos = 2, 3
+    t = IneffectiveTracker(n_pos, n_bg)
+    # sval=0: pos0 ineffective (eq True) on both bg; pos1 effective; pos2 effective
+    t.update(0, np.array([[[True, False, False]], [[True, False, False]]]))
+    # sval=7: pos0 effective on both bg; pos1 effective; pos2 effective
+    t.update(7, np.array([[[False, False, False]], [[False, False, False]]]))
+    hit = t.hit()
+    assert hit is not None and hit[0] == 0, f"pos0 has both an ineffective (0) and effective (7): {hit}"
+    assert hit[1] == [(0, 7), (0, 7)], f"witness per background: {hit[1]}"
+    # a tracker that only ever sees 'effective' never hits
+    t2 = IneffectiveTracker(n_pos, n_bg)
+    t2.update(1, np.zeros((n_bg, 1, n_pos), bool))
+    t2.update(2, np.zeros((n_bg, 1, n_pos), bool))
+    assert t2.hit() is None, "all-effective -> no witness"
+
+
+def test_constructive_phi_runs():
+    """ucpqc.phi (constructive ineffective sweep) runs on an annotated function-level
+    target and returns a well-formed PhiResult: interior bl fault sites, per-site detect
+    verdict, and a witness note when it detects."""
     from ucpqc import phi
     from ucpqc.profiles import profile_for
-    need(DILITHIUM_REF)
-    m = Machine.from_elf(DILITHIUM_REF)
+    need(DILITHIUM)
+    m = Machine.from_elf(DILITHIUM)
     scheme = Scheme.bind(m)
     m.boot()
     prof = profile_for(scheme)
-    res = phi.per_position_phi(scheme, prof, sites="polyvecl_add", k=4)
-    assert res.k == 4 and len(res.sites) == 1, "one resolved site, K recorded"
-    s = res.sites[0]
-    assert "polyvecl_add" in s.label
-    assert isinstance(s.witnesses, list) and s.n_split >= len(s.witnesses)
-    if s.witnesses:                                  # stochastic; attribution when it flags
-        assert "coeff[" in s.attribution, s.attribution
+    res = phi.per_position_phi(scheme, prof, "polyvecl_add", k=4, domain_cap=6)
+    assert res.target == "polyvecl_add" and res.k >= 2, "backgrounds captured"
+    assert res.sites, "polyvecl_add has interior bl fault site(s) to skip"
+    for s in res.sites:
+        assert isinstance(s.detected, bool) and s.note
+        if s.detected:
+            assert "ineffective" in s.note and "effective" in s.note
 
 
 def test_parallel_sweep_matches_serial():
